@@ -86,6 +86,26 @@ namespace Emby.Xtream.Plugin
                 // Never let the safety copy block the save it is protecting.
             }
 
+            try
+            {
+                // ADR-F010: the decision stores are owned by the plugin's store, not the
+                // configuration blob. A save that carries different store values (a dashboard
+                // review edit, a restore) is applied through the store's lock before it lands,
+                // so two writers can no longer silently lose one another's decisions. Settings
+                // themselves still flow through Emby's save path unchanged, and a save whose
+                // stores match the current ones never touches the store at all.
+                var incoming = configuration as PluginConfiguration;
+                if (incoming != null)
+                {
+                    _strmSyncService?.RouteDecisionStoreWrites(Configuration, incoming);
+                }
+            }
+            catch
+            {
+                // The store protects the save, never blocks it. The mirrors it keeps in the
+                // configuration still carry the last known decisions either way.
+            }
+
             base.UpdateConfiguration(configuration);
         }
 

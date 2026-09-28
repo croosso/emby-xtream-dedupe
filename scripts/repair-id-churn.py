@@ -18,6 +18,8 @@ to a path you choose, for you to diff and install yourself:
 
     docker stop emby
     cp candidate.xml /path/to/emby/config/plugins/configurations/<name>.xml
+    # If the records root holds decisions.json, move it aside too — since ADR-F010 that file,
+    # not the config, is the authoritative copy of these id lists (the script prints the path).
     docker start emby
 
 Emby holds the config in memory and rewrites the file on its next save, so it must be
@@ -178,6 +180,23 @@ def print_report(results, tmdb_only):
                 print("      %-8d -> %-8d  %-5s  %s" % (dead_id, new_id, how, name[:50]))
 
 
+def decision_store_path(tree, config_path):
+    """Where the plugin's decision store file lives (ADR-F010).
+
+    Since ADR-F010 the four id stores have an authoritative home in ``decisions.json`` under
+    the records root; the config XML holds mirrors the plugin refreshes on every decision. A
+    hand-installed config's id lists are therefore IGNORED while that file exists — the install
+    steps tell the user to move it aside so the store re-seeds from the repaired config.
+
+    The derivation mirrors StrmSyncService.ResolveRecordsRoot: an explicit RecordsPath wins,
+    otherwise the folder holding the config plus ``xtream-backups``.
+    """
+    records = (tree.getroot().findtext("RecordsPath") or "").strip()
+    if not records:
+        records = os.path.join(os.path.dirname(os.path.abspath(config_path)), "xtream-backups")
+    return os.path.join(records, "decisions.json")
+
+
 def write_candidate(tree, results, path, prune_resolved):
     root = tree.getroot()
     # Emit the prefixes .NET's XmlSerializer uses, so the round-trip stays close to what
@@ -325,11 +344,20 @@ def main(argv):
     print("\nCandidate written to %s" % args.write)
     for element, kept, added in changed:
         print("  %-26s %d kept + %d added" % (element, kept, added))
+    store = decision_store_path(tree, config_path)
     print("\nBefore installing it:")
     print("  1. diff it against %s and satisfy yourself the only changes are id lists." % config_path)
     print("  2. docker stop emby   (Emby rewrites the file from memory otherwise)")
     print("  3. copy the candidate over the original filename")
-    print("  4. docker start emby, then reload the config page with the cache disabled")
+    if os.path.exists(store):
+        print("  4. move %s aside too (ADR-F010: the decision store is authoritative and" % store)
+        print("     would otherwise ignore the repaired id lists; without it the store re-seeds")
+        print("     from the repaired config on the next start)")
+        print("  5. docker start emby, then reload the config page with the cache disabled")
+    else:
+        print("  4. docker start emby, then reload the config page with the cache disabled")
+        print("\n(No decisions.json under the records root, so the repaired id lists are the"
+              "\n only copy — nothing else to move aside.)")
     return 0
 
 

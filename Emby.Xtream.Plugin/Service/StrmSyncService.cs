@@ -505,6 +505,47 @@ namespace Emby.Xtream.Plugin.Service
         }
 
         /// <summary>
+        /// The process-wide decision store for this configuration (ADR-F010). Keyed on the records
+        /// root, so a configuration that relocates it gets the separate history its records
+        /// already have. One store per root, shared by every service instance — Emby constructs
+        /// service classes independently of <see cref="Plugin"/>, so instance state would give
+        /// two writers two different stores.
+        /// </summary>
+        internal DecisionStore GetDecisionStore(PluginConfiguration config)
+        {
+            return DecisionStore.GetOrCreate(ResolveRecordsRoot(config), _logger);
+        }
+
+        /// <summary>
+        /// Routes a configuration save's decision-store changes through the store before they land
+        /// (ADR-F010). Called from <see cref="Plugin.UpdateConfiguration"/>, which is the single
+        /// path every dashboard save and every restore already takes — so the review UI keeps
+        /// working unchanged while its writes become serialized instead of read-modify-write of
+        /// the whole configuration.
+        /// </summary>
+        /// <remarks>
+        /// A save whose stores match the current ones (the common case: a settings-only save)
+        /// never touches the store. A save whose stores differ replaces them wholesale, which is
+        /// the dashboard's own full-list semantics — including the one race this cannot fix: a
+        /// page edited while another writer changed the stores still wins, exactly as any web
+        /// form does. What it does fix is everything else losing to that save.
+        /// </remarks>
+        internal void RouteDecisionStoreWrites(PluginConfiguration current, PluginConfiguration incoming)
+        {
+            if (current == null || incoming == null)
+            {
+                return;
+            }
+
+            if (DecisionStore.DecisionStoresEqual(current, incoming))
+            {
+                return;
+            }
+
+            GetDecisionStore(current).Replace(current, incoming);
+        }
+
+        /// <summary>
         /// Applies a saved configuration, replacing the live one (ADR-F005 mechanism 9).
         /// </summary>
         /// <remarks>
@@ -1777,46 +1818,50 @@ namespace Emby.Xtream.Plugin.Service
             bool allowRepoint,
             Action saveConfig)
         {
-            var reviewedIds = DeserializeIdSet(config.ReviewedVodStreamIdsJson);
-            if (reviewedIds == null)
-            {
-                _logger.Error(
-                    "ReviewedVodStreamIdsJson could not be parsed, so movie decisions will not be reconciled against "
-                    + "provider id changes this run. Every reviewed mark would otherwise look withdrawn, and the "
-                    + "identity records for them would be dropped. Check the plugin configuration file.");
-                return;
-            }
-
-            var tmdbByStreamId = DeserializeTmdbMap(config.VodDecisionTmdbIdsJson);
-            if (tmdbByStreamId == null)
-            {
-                _logger.Error(
-                    "VodDecisionTmdbIdsJson could not be parsed, so movie decisions will not be reconciled against "
-                    + "provider id changes this run. The field is left untouched for repair rather than rebuilt — "
-                    + "rebuilding would silently discard every identity recorded so far. Check the plugin configuration file.");
-                return;
-            }
-
-            var excludedIds = new HashSet<int>(config.ExcludedVodStreamIds ?? new int[0]);
-
             const int RepointSampleSize = 15;
-            var outcome = ReconcileMovieDecisionIdentity(
-                fetchedStreams, excludedIds, reviewedIds, tmdbByStreamId, allowRepoint, RepointSampleSize);
 
-            if (!outcome.ChangedAnything)
+            // Captured inside the mutation so the coverage log reports the numbers that were
+            // actually persisted, not a copy taken a moment before.
+            int identityCount = 0;
+            int decisionCount = 0;
+
+            // The pass runs under the store's lock: reading the stores, computing and writing
+            // them back is one operation, so a decision recorded concurrently (a dashboard save,
+            // a future approval webhook) cannot be lost between the read and the write (ADR-F010).
+            var outcome = GetDecisionStore(config).Mutate(config, state =>
+            {
+                if (state.ReviewedVodStreamIds == null)
+                {
+                    _logger.Error(
+                        "ReviewedVodStreamIdsJson could not be parsed, so movie decisions will not be reconciled against "
+                        + "provider id changes this run. Every reviewed mark would otherwise look withdrawn, and the "
+                        + "identity records for them would be dropped. Check the plugin configuration file.");
+                    return null;
+                }
+
+                if (state.VodDecisionTmdbIds == null)
+                {
+                    _logger.Error(
+                        "VodDecisionTmdbIdsJson could not be parsed, so movie decisions will not be reconciled against "
+                        + "provider id changes this run. The field is left untouched for repair rather than rebuilt — "
+                        + "rebuilding would silently discard every identity recorded so far. Check the plugin configuration file.");
+                    return null;
+                }
+
+                var result = ReconcileMovieDecisionIdentity(
+                    fetchedStreams, state.ExcludedVodStreamIds, state.ReviewedVodStreamIds,
+                    state.VodDecisionTmdbIds, allowRepoint, RepointSampleSize);
+
+                identityCount = state.VodDecisionTmdbIds.Count;
+                decisionCount = state.ExcludedVodStreamIds.Count + state.ReviewedVodStreamIds.Count;
+                return result;
+            });
+
+            if (outcome == null || !outcome.ChangedAnything)
             {
                 return;
             }
 
-            if (outcome.ChangedStores)
-            {
-                var ordered = new List<int>(excludedIds);
-                ordered.Sort();
-                config.ExcludedVodStreamIds = ordered.ToArray();
-                config.ReviewedVodStreamIdsJson = SerializeIdSet(reviewedIds);
-            }
-
-            config.VodDecisionTmdbIdsJson = SerializeTmdbMap(tmdbByStreamId);
             saveConfig?.Invoke();
 
             if (outcome.MovedTitles > 0)
@@ -1851,8 +1896,8 @@ namespace Emby.Xtream.Plugin.Service
                     + "longer stored — {2} of {3} movie decisions now carry one",
                     outcome.Backfilled,
                     outcome.Pruned,
-                    tmdbByStreamId.Count,
-                    excludedIds.Count + reviewedIds.Count);
+                    identityCount,
+                    decisionCount);
             }
         }
 
@@ -2265,7 +2310,9 @@ namespace Emby.Xtream.Plugin.Service
 
                 // Per-item exclusions (issue #57): split the catalogue before anything else reads it.
                 // The excluded half is kept so its on-disk folders can be removed below.
-                var excludedVodSet = ContentExclusionFilter.BuildSet(config.ExcludedVodStreamIds);
+                // Read through the decision store: it is the authoritative copy, and the mirrors
+                // can lag it briefly when a configuration save landed an unreadable value (ADR-F010).
+                var excludedVodSet = GetDecisionStore(config).Read(config).ExcludedVodStreamIds;
                 var excludedMovies = new List<Tuple<string, int?>>();
                 var allStreams = fetchedStreams;
                 if (excludedVodSet.Count > 0)
@@ -2322,7 +2369,7 @@ namespace Emby.Xtream.Plugin.Service
                 // already on disk is held rather than written, so a provider's overnight
                 // additions land in the review queue instead of the library.
                 var reviewGateOn = config.RequireReviewBeforeSync;
-                var reviewedVodSet = DeserializeIdSet(config.ReviewedVodStreamIdsJson);
+                var reviewedVodSet = GetDecisionStore(config).Read(config).ReviewedVodStreamIds;
                 if (reviewGateOn && reviewedVodSet == null)
                 {
                     // The store did not parse. Standing down is the only safe reading: treating
@@ -2612,12 +2659,10 @@ namespace Emby.Xtream.Plugin.Service
                     // it. Only ever adds; the gate never marks anything un-reviewed.
                     if (autoReviewed.Count > 0)
                     {
-                        foreach (var entry in autoReviewed)
-                        {
-                            reviewedVodSet.Add(entry.Item1);
-                        }
-
-                        config.ReviewedVodStreamIdsJson = SerializeIdSet(reviewedVodSet);
+                        // Merged into the CURRENT checkpoint through the store rather than
+                        // serialized over it, so a decision recorded while the sync ran (a
+                        // dashboard save, a future approval webhook) survives the fold (ADR-F010).
+                        GetDecisionStore(config).AddReviewed(config, false, autoReviewed.Select(e => e.Item1));
                         saveConfig?.Invoke();
 
                         var restored = autoReviewed
@@ -2845,7 +2890,7 @@ namespace Emby.Xtream.Plugin.Service
                 }
 
                 // Per-item exclusions (issue #57) — see the matching block in SyncMoviesAsync.
-                var excludedSeriesSet = ContentExclusionFilter.BuildSet(config.ExcludedSeriesIds);
+                var excludedSeriesSet = GetDecisionStore(config).Read(config).ExcludedSeriesIds;
 
                 // Path-A (ADR-F001): exclusions are stored per SeriesId, but Dispatcharr issues a
                 // distinct SeriesId per (provider, category) for the same show. A category enabled
@@ -3061,7 +3106,7 @@ namespace Emby.Xtream.Plugin.Service
                 // Review gate for series. Same flag as movies, same fail-open reading of an
                 // unparseable checkpoint — see SyncMoviesAsync and ADR-F002.
                 var reviewGateOn = config.RequireReviewBeforeSync;
-                var reviewedSeriesSet = DeserializeIdSet(config.ReviewedSeriesIdsJson);
+                var reviewedSeriesSet = GetDecisionStore(config).Read(config).ReviewedSeriesIds;
                 if (reviewGateOn && reviewedSeriesSet == null)
                 {
                     _logger.Error(
@@ -3514,12 +3559,8 @@ namespace Emby.Xtream.Plugin.Service
                     // heal itself as the provider reshuffles ids.
                     if (autoReviewed.Count > 0)
                     {
-                        foreach (var entry in autoReviewed)
-                        {
-                            reviewedSeriesSet.Add(entry.Item1);
-                        }
-
-                        config.ReviewedSeriesIdsJson = SerializeIdSet(reviewedSeriesSet);
+                        // Same merge-not-overwrite contract as the movie fold above (ADR-F010).
+                        GetDecisionStore(config).AddReviewed(config, true, autoReviewed.Select(e => e.Item1));
                         saveConfig?.Invoke();
 
                         var restored = autoReviewed
