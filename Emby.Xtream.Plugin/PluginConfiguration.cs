@@ -178,6 +178,17 @@ namespace Emby.Xtream.Plugin
         public string ReviewedVodStreamIdsJson { get; set; } = string.Empty;
 
         /// <summary>
+        /// Unreviewed-tombstone checkpoint (ADR-F008): JSON array of VOD StreamIds the user
+        /// has deliberately marked "unreviewed" in the de-duplicated view. The review gate's
+        /// on-disk exemption would otherwise re-review such a title on the next sync — its
+        /// folder is still on disk, which is exactly the state the user is undoing — so an
+        /// un-review could never persist. A tombstoned title is held like any un-reviewed
+        /// one, its files are removed from the library on the next sync, and it stays in the
+        /// review queue. Reviewing the title clears the tombstone.
+        /// </summary>
+        public string UnreviewedVodStreamIdsJson { get; set; } = string.Empty;
+
+        /// <summary>
         /// Durable identity for movie decisions (ADR-F004 stage 3): a JSON dictionary
         /// mapping StreamId → TMDB id, covering every movie StreamId that appears in
         /// <see cref="ExcludedVodStreamIds"/> or <see cref="ReviewedVodStreamIdsJson"/>.
@@ -223,6 +234,14 @@ namespace Emby.Xtream.Plugin
         /// JSON array of reviewed SeriesIds; reviewed = this set OR excluded.
         /// </summary>
         public string ReviewedSeriesIdsJson { get; set; } = string.Empty;
+
+        /// <summary>
+        /// Unreviewed-tombstone checkpoint for series (ADR-F008). Same semantics as
+        /// <see cref="UnreviewedVodStreamIdsJson"/>: JSON array of SeriesIds deliberately
+        /// marked un-reviewed, so the review gate holds the show and removes its files
+        /// instead of re-reviewing it off the disk.
+        /// </summary>
+        public string UnreviewedSeriesIdsJson { get; set; } = string.Empty;
 
         // Content name cleaning
         public bool EnableContentNameCleaning { get; set; }

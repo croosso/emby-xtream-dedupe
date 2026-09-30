@@ -443,14 +443,14 @@ namespace Emby.Xtream.Plugin.Service
         /// Writes a reviewed-checkpoint store back out as a JSON array.
         /// </summary>
         /// <summary>
-        /// Reports the size of all four decision stores at the end of a sync (ADR-F005).
+        /// Reports the size of all six decision stores at the end of a sync (ADR-F005).
         /// <para>
-        /// The exclusions and reviewed marks are the expensive, irreplaceable part of this
-        /// plugin's state — tens of thousands of individual decisions that cannot be
-        /// reconstructed. Nothing used to surface their size, so a store shrinking was
-        /// invisible until someone noticed the review queue looked wrong, which could be
-        /// weeks. The sync already reads every one of them, so a line per run costs nothing
-        /// and turns a single reading into a trend.
+        /// The exclusions, reviewed marks and un-review tombstones are the expensive,
+        /// irreplaceable part of this plugin's state — tens of thousands of individual
+        /// decisions that cannot be reconstructed. Nothing used to surface their size, so a
+        /// store shrinking was invisible until someone noticed the review queue looked wrong,
+        /// which could be weeks. The sync already reads every one of them, so a line per run
+        /// costs nothing and turns a single reading into a trend.
         /// </para>
         /// <para>
         /// Deliberately does not warn or alarm on a drop. The plugin cannot tell a user
@@ -461,11 +461,13 @@ namespace Emby.Xtream.Plugin.Service
         private void LogDecisionStoreSizes(PluginConfiguration config)
         {
             _logger.Info(
-                "Decision stores: {0} excluded movies, {1} excluded series, {2} reviewed movies, {3} reviewed series",
+                "Decision stores: {0} excluded movies, {1} excluded series, {2} reviewed movies, {3} reviewed series, {4} un-reviewed movies, {5} un-reviewed series",
                 config.ExcludedVodStreamIds?.Length ?? 0,
                 config.ExcludedSeriesIds?.Length ?? 0,
                 DescribeIdSetSize(config.ReviewedVodStreamIdsJson),
-                DescribeIdSetSize(config.ReviewedSeriesIdsJson));
+                DescribeIdSetSize(config.ReviewedSeriesIdsJson),
+                DescribeIdSetSize(config.UnreviewedVodStreamIdsJson),
+                DescribeIdSetSize(config.UnreviewedSeriesIdsJson));
 
             AppendDecisionStoreCounts(config);
         }
@@ -789,6 +791,7 @@ namespace Emby.Xtream.Plugin.Service
         {
             "ExcludedVodStreamIds", "ExcludedSeriesIds",
             "ReviewedVodStreamIdsJson", "ReviewedSeriesIdsJson",
+            "UnreviewedVodStreamIdsJson", "UnreviewedSeriesIdsJson",
             "VodDecisionTmdbIdsJson", "SeriesEpisodeHashesJson",
             "LastMovieSyncTimestamp", "LastSeriesSyncTimestamp",
             "SyncHistoryJson", "LastInstalledVersion",
@@ -1521,6 +1524,7 @@ namespace Emby.Xtream.Plugin.Service
             public int Backfilled { get; set; }
             public int RepointedExclusions { get; set; }
             public int RepointedReviews { get; set; }
+            public int RepointedUnreviews { get; set; }
             public int DeclinedExclusions { get; set; }
             public int Pruned { get; set; }
 
@@ -1537,7 +1541,7 @@ namespace Emby.Xtream.Plugin.Service
 
             public bool ChangedStores
             {
-                get { return RepointedExclusions > 0 || RepointedReviews > 0; }
+                get { return RepointedExclusions > 0 || RepointedReviews > 0 || RepointedUnreviews > 0; }
             }
 
             public bool ChangedAnything
@@ -1580,27 +1584,31 @@ namespace Emby.Xtream.Plugin.Service
             IList<VodStreamInfo> fetchedStreams,
             HashSet<int> excludedIds,
             HashSet<int> reviewedIds,
+            HashSet<int> unreviewedIds,
             Dictionary<int, int> tmdbByStreamId,
             bool allowRepoint,
             int sampleSize)
         {
             var result = new MovieIdentityReconciliation();
-            if (fetchedStreams == null || excludedIds == null || reviewedIds == null || tmdbByStreamId == null)
+            if (fetchedStreams == null || excludedIds == null || reviewedIds == null || unreviewedIds == null
+                || tmdbByStreamId == null)
             {
                 return result;
             }
 
             // 1. Drop identity records whose decision is gone. An entry whose StreamId is in
-            //    neither store means the user withdrew that decision — through the de-dup view
+            //    no store means the user withdrew that decision — through the de-dup view
             //    or through upstream's category tree, which knows nothing about TMDB and so
             //    cannot clean up after itself. Without this step the next pass would read the
             //    orphaned entry as a rotation and helpfully restore what the user removed.
             //    This is the whole reason the map stores PAIRS rather than a set of TMDB ids:
-            //    a bare set cannot tell a withdrawn decision from a rotated id.
+            //    a bare set cannot tell a withdrawn decision from a rotated id. The un-review
+            //    tombstones (ADR-F008) count as a live decision here: their whole job is to be
+            //    remembered across a rotation, so dropping their identity would undo them.
             var stale = new List<int>();
             foreach (var kv in tmdbByStreamId)
             {
-                if (!excludedIds.Contains(kv.Key) && !reviewedIds.Contains(kv.Key))
+                if (!excludedIds.Contains(kv.Key) && !reviewedIds.Contains(kv.Key) && !unreviewedIds.Contains(kv.Key))
                 {
                     stale.Add(kv.Key);
                 }
@@ -1654,7 +1662,8 @@ namespace Emby.Xtream.Plugin.Service
                     continue;
                 }
 
-                if (!excludedIds.Contains(s.StreamId) && !reviewedIds.Contains(s.StreamId))
+                if (!excludedIds.Contains(s.StreamId) && !reviewedIds.Contains(s.StreamId)
+                    && !unreviewedIds.Contains(s.StreamId))
                 {
                     continue;
                 }
@@ -1712,6 +1721,23 @@ namespace Emby.Xtream.Plugin.Service
                 {
                     reviewedIds.Add(move.Value);
                     result.RepointedReviews++;
+                    applied.Add(move.Key);
+                }
+            }
+
+            // 4b. Un-review tombstones (ADR-F008), with the same one-sided guard: carrying a
+            //     tombstone onto an id the user has since reviewed-and-kept would silently
+            //     withhold a title they explicitly re-approved — a newer decision that wins.
+            //     The reverse is left alone: re-reviewing clears the tombstone in the UI, so
+            //     a tombstone without a reviewed mark is the user's last word.
+            foreach (var move in repointed)
+            {
+                if (unreviewedIds.Contains(move.Key)
+                    && !unreviewedIds.Contains(move.Value)
+                    && !reviewedIds.Contains(move.Value))
+                {
+                    unreviewedIds.Add(move.Value);
+                    result.RepointedUnreviews++;
                     applied.Add(move.Key);
                 }
             }
@@ -1797,11 +1823,21 @@ namespace Emby.Xtream.Plugin.Service
                 return;
             }
 
+            var unreviewedIds = DeserializeIdSet(config.UnreviewedVodStreamIdsJson);
+            if (unreviewedIds == null)
+            {
+                _logger.Error(
+                    "UnreviewedVodStreamIdsJson could not be parsed, so movie decisions will not be reconciled against "
+                    + "provider id changes this run. Carrying the other stores across without the tombstones would let a "
+                    + "re-issued id resurrect a decision the user withdrew. Check the plugin configuration file.");
+                return;
+            }
+
             var excludedIds = new HashSet<int>(config.ExcludedVodStreamIds ?? new int[0]);
 
             const int RepointSampleSize = 15;
             var outcome = ReconcileMovieDecisionIdentity(
-                fetchedStreams, excludedIds, reviewedIds, tmdbByStreamId, allowRepoint, RepointSampleSize);
+                fetchedStreams, excludedIds, reviewedIds, unreviewedIds, tmdbByStreamId, allowRepoint, RepointSampleSize);
 
             if (!outcome.ChangedAnything)
             {
@@ -1814,6 +1850,7 @@ namespace Emby.Xtream.Plugin.Service
                 ordered.Sort();
                 config.ExcludedVodStreamIds = ordered.ToArray();
                 config.ReviewedVodStreamIdsJson = SerializeIdSet(reviewedIds);
+                config.UnreviewedVodStreamIdsJson = SerializeIdSet(unreviewedIds);
             }
 
             config.VodDecisionTmdbIdsJson = SerializeTmdbMap(tmdbByStreamId);
@@ -1824,11 +1861,12 @@ namespace Emby.Xtream.Plugin.Service
                 // A sample, not just a count, for the same reason the review gate logs held
                 // titles by name: "carried 8,560 decisions across" cannot be checked by anyone.
                 _logger.Info(
-                    "Movie identity: {0} title(s) came back under a new StreamId — carried {1} exclusion(s) and "
-                    + "{2} reviewed mark(s) across: {3}{4}",
+                    "Movie identity: {0} title(s) came back under a new StreamId — carried {1} exclusion(s), "
+                    + "{2} reviewed mark(s) and {3} un-review(s) across: {4}{5}",
                     outcome.MovedTitles,
                     outcome.RepointedExclusions,
                     outcome.RepointedReviews,
+                    outcome.RepointedUnreviews,
                     string.Join(", ", outcome.Samples),
                     outcome.MovedTitles > outcome.Samples.Count ? ", ..." : string.Empty);
             }
@@ -1852,7 +1890,7 @@ namespace Emby.Xtream.Plugin.Service
                     outcome.Backfilled,
                     outcome.Pruned,
                     tmdbByStreamId.Count,
-                    excludedIds.Count + reviewedIds.Count);
+                    excludedIds.Count + reviewedIds.Count + unreviewedIds.Count);
             }
         }
 
@@ -2334,6 +2372,27 @@ namespace Emby.Xtream.Plugin.Service
                     reviewGateOn = false;
                 }
 
+                // Deliberate-unreview tombstones (ADR-F008). The on-disk exemption below cannot
+                // on its own tell "the provider re-issued an id for a title you keep" from "you
+                // just un-reviewed a title whose folder is still on disk" — without this store
+                // the exemption re-reviews the title on the very next sync, and an un-review
+                // never persists.
+                var unreviewedVodSet = DeserializeIdSet(config.UnreviewedVodStreamIdsJson);
+                var onDiskExemptionOn = true;
+                if (reviewGateOn && unreviewedVodSet == null)
+                {
+                    // Unparseable: stand the exemption down rather than guess which titles are
+                    // tombstoned. Resuming it would resurrect every deliberate un-review, while
+                    // holding is the reversible direction — the worst case is that established
+                    // titles wait in the review queue until the field is repaired.
+                    _logger.Error(
+                        "UnreviewedVodStreamIdsJson could not be parsed, so the review gate's on-disk exemption is disabled for this run. "
+                        + "Titles you already keep are held until the field is repaired, but anything you deliberately un-reviewed stays un-reviewed. "
+                        + "Check the plugin configuration file.");
+                    unreviewedVodSet = new HashSet<int>();
+                    onDiskExemptionOn = false;
+                }
+
                 // What the user already keeps, keyed on identity rather than provider id — the
                 // exemption that stops the gate withholding an established film whose id the
                 // provider reassigned. Also the reason a held title never has files to protect
@@ -2351,6 +2410,9 @@ namespace Emby.Xtream.Plugin.Service
 
                 var heldForReview = 0;
                 var autoReviewed = new List<Tuple<int, string>>();
+                // Titles held because the user deliberately un-reviewed them (ADR-F008), kept in
+                // the same shape as excludedMovies so the removal pass below can consume them.
+                var unreviewedMovies = new List<Tuple<string, int?>>();
                 // A sample of what was held. The gate's whole effect is content NOT appearing,
                 // so a bare count gives no way to tell "held the 5,000 new titles" from "held
                 // your entire library because the identity index came up empty".
@@ -2395,14 +2457,38 @@ namespace Emby.Xtream.Plugin.Service
                         // Held is not excluded: nothing is added to a blocklist and no folder is
                         // removed. And a held title has no files to protect — anything on disk
                         // matched the index above and took the exempt path.
+                        //
+                        // A deliberately un-reviewed title (ADR-F008) is held BEFORE the
+                        // exemption, because the folder being on disk is exactly the keep
+                        // decision the user is withdrawing. It is recorded for the removal pass
+                        // below instead: the files leave the library and the title goes back to
+                        // the review queue, which is where the user asked to see it again.
                         if (reviewGateOn && !reviewedVodSet.Contains(movie.StreamId))
                         {
+                            if (unreviewedVodSet.Contains(movie.StreamId))
+                            {
+                                Interlocked.Increment(ref heldForReview);
+                                lock (heldTitles)
+                                {
+                                    if (heldTitles.Count < HeldSampleSize) heldTitles.Add(cleanedName);
+                                }
+                                lock (unreviewedMovies)
+                                {
+                                    unreviewedMovies.Add(Tuple.Create(cleanedName, movie.CategoryId));
+                                }
+                                Interlocked.Increment(ref _movieProgress.Skipped);
+                                Interlocked.Increment(ref _movieProgress.Completed);
+                                ReportTaskProgress(_movieProgress, taskProgress);
+                                return;
+                            }
+
                             int providerTmdb;
                             var hasTmdb = IsValidTmdbId(movie.TmdbId)
                                 && int.TryParse(movie.TmdbId.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out providerTmdb)
                                 && libraryTmdbIds.Contains(providerTmdb);
+                            var onDisk = hasTmdb || libraryFolderNames.Contains(movieName);
 
-                            if (!hasTmdb && !libraryFolderNames.Contains(movieName))
+                            if (!onDiskExemptionOn || !onDisk)
                             {
                                 Interlocked.Increment(ref heldForReview);
                                 lock (heldTitles)
@@ -2653,6 +2739,29 @@ namespace Emby.Xtream.Plugin.Service
                     _movieProgress.Deleted += RemoveExcludedContent(
                         config, excludedMovies, config.MovieFolderMode, categoryNames, folderMappings, "Movies",
                         writtenPaths);
+                }
+
+                // Remove the files of titles deliberately un-reviewed this run (ADR-F008). The
+                // user withdrew a keep decision, so the files leave the library the same run
+                // rather than lingering as playback-ready leftovers. Same targeted pass and
+                // same safety contract as exclusions: only this plugin's own .strm/.nfo files,
+                // never a folder it cannot prove it wrote.
+                if (unreviewedMovies.Count > 0)
+                {
+                    _movieProgress.Phase = "Removing un-reviewed movies";
+                    _movieProgress.Deleted += RemoveExcludedContent(
+                        config, unreviewedMovies, config.MovieFolderMode, categoryNames, folderMappings, "Movies",
+                        writtenPaths);
+                    var removedSample = unreviewedMovies
+                        .Select(m => m.Item1)
+                        .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
+                        .Take(HeldSampleSize)
+                        .ToList();
+                    _logger.Info(
+                        "Review gate: removed the files of {0} title(s) you had marked un-reviewed — they are back in the review queue: {1}{2}",
+                        unreviewedMovies.Count,
+                        string.Join(", ", removedSample),
+                        unreviewedMovies.Count > removedSample.Count ? ", ..." : string.Empty);
                 }
 
                 // Cleanup orphans. Skipped when any category failed to answer: those titles are
@@ -3070,6 +3179,21 @@ namespace Emby.Xtream.Plugin.Service
                     reviewGateOn = false;
                 }
 
+                // Deliberate-unreview tombstones (ADR-F008) — the series twin of the movie
+                // gate's store. Same fail-safe on an unparseable field: the on-disk exemption
+                // stands down rather than risk resurrecting a decision the user withdrew.
+                var unreviewedSeriesSet = DeserializeIdSet(config.UnreviewedSeriesIdsJson);
+                var onDiskExemptionOn = true;
+                if (reviewGateOn && unreviewedSeriesSet == null)
+                {
+                    _logger.Error(
+                        "UnreviewedSeriesIdsJson could not be parsed, so the review gate's on-disk exemption is disabled for series this run. "
+                        + "Shows you already keep are held until the field is repaired, but anything you deliberately un-reviewed stays un-reviewed. "
+                        + "Check the plugin configuration file.");
+                    unreviewedSeriesSet = new HashSet<int>();
+                    onDiskExemptionOn = false;
+                }
+
                 // Only the folder names matter here — the TMDB set the movie side leans on is
                 // unusable for series, which have no TMDB id on the list payload to compare
                 // against. Collected anyway; the call signature is shared.
@@ -3087,6 +3211,9 @@ namespace Emby.Xtream.Plugin.Service
                 var heldForReview = 0;
                 var autoReviewed = new List<Tuple<int, string>>();
                 var heldTitles = new List<string>();
+                // Shows held because the user deliberately un-reviewed them (ADR-F008), in the
+                // same shape as excludedSeriesItems for the removal pass below.
+                var unreviewedSeriesItems = new List<Tuple<string, int?>>();
                 // Recorded by the gate itself rather than recomputed afterwards, so the two can
                 // never disagree about what was held. Used to exempt held series from the
                 // no-episode-hash diagnostic below: they have no hash because they were
@@ -3184,12 +3311,33 @@ namespace Emby.Xtream.Plugin.Service
                         // is keyed on SeriesId and so survives the provider renaming a show.
                         // SeriesIds themselves measured 0.3% dead, which is what makes the hash a
                         // dependable second marker rather than a nicety.
+                        // A deliberately un-reviewed show (ADR-F008) is held before the exemption —
+                        // same reasoning as the movie gate: the folder on disk is the keep decision
+                        // being withdrawn, and the files leave via the removal pass below.
                         if (reviewGateOn && !reviewedSeriesSet.Contains(series.SeriesId))
                         {
+                            if (unreviewedSeriesSet.Contains(series.SeriesId))
+                            {
+                                Interlocked.Increment(ref heldForReview);
+                                lock (heldTitles)
+                                {
+                                    if (heldTitles.Count < HeldSampleSize) heldTitles.Add(cleanedName);
+                                }
+                                lock (heldIds) { heldIds.Add(series.SeriesId); }
+                                lock (unreviewedSeriesItems)
+                                {
+                                    unreviewedSeriesItems.Add(Tuple.Create(cleanedName, series.CategoryId));
+                                }
+                                Interlocked.Increment(ref _seriesProgress.Skipped);
+                                Interlocked.Increment(ref _seriesProgress.Completed);
+                                ReportTaskProgress(_seriesProgress, taskProgress);
+                                return;
+                            }
+
                             var onDisk = libraryFolderNames.Contains(seriesName)
                                 || storedHashes.ContainsKey(series.SeriesId.ToString(CultureInfo.InvariantCulture));
 
-                            if (!onDisk)
+                            if (!onDiskExemptionOn || !onDisk)
                             {
                                 Interlocked.Increment(ref heldForReview);
                                 lock (heldTitles)
@@ -3555,6 +3703,26 @@ namespace Emby.Xtream.Plugin.Service
                     _seriesProgress.Deleted += RemoveExcludedContent(
                         config, excludedSeriesItems, config.SeriesFolderMode, categoryNames, folderMappings, "Shows",
                         writtenPaths);
+                }
+
+                // Remove the files of shows deliberately un-reviewed this run (ADR-F008) — the
+                // series twin of the movie pass above, same safety contract.
+                if (unreviewedSeriesItems.Count > 0)
+                {
+                    _seriesProgress.Phase = "Removing un-reviewed series";
+                    _seriesProgress.Deleted += RemoveExcludedContent(
+                        config, unreviewedSeriesItems, config.SeriesFolderMode, categoryNames, folderMappings, "Shows",
+                        writtenPaths);
+                    var removedSample = unreviewedSeriesItems
+                        .Select(s => s.Item1)
+                        .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
+                        .Take(HeldSampleSize)
+                        .ToList();
+                    _logger.Info(
+                        "Review gate: removed the files of {0} show(s) you had marked un-reviewed — they are back in the review queue: {1}{2}",
+                        unreviewedSeriesItems.Count,
+                        string.Join(", ", removedSample),
+                        unreviewedSeriesItems.Count > removedSample.Count ? ", ..." : string.Empty);
                 }
 
                 // Cleanup orphans. Skipped when any category failed to answer — see the

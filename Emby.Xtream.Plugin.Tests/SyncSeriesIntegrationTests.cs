@@ -907,6 +907,40 @@ namespace Emby.Xtream.Plugin.Tests
         }
 
         /// <summary>
+        /// The series twin of the movie tombstone test (ADR-F008): a show deliberately
+        /// un-reviewed must stay un-reviewed despite its folder being on disk, and its
+        /// files must leave the library the same run.
+        /// </summary>
+        [Fact]
+        public async Task ReviewGate_Series_DeliberatelyUnreviewedOnDisk_HeldAndFilesRemoved()
+        {
+            var config = DefaultConfig();
+            config.RequireReviewBeforeSync = true;
+            config.ReviewedSeriesIdsJson = "[]";
+            config.UnreviewedSeriesIdsJson = "[7]";
+
+            // Written by an earlier sync: show folder with an episode.
+            var episode = EpisodeStrmPath("Established Show", season: 1, episode: 1);
+            Directory.CreateDirectory(Path.GetDirectoryName(episode));
+            File.WriteAllText(episode, "http://fake-xtream/series/user/pass/7/1/1.mp4");
+
+            Handler.RespondWith("action=get_series", SeriesListJson(
+                Series(seriesId: 7, name: "Established Show", lastModified: "1000")));
+
+            var svc = MakeService();
+            await svc.SyncSeriesAsync(config, None, SaveConfig);
+
+            Assert.False(File.Exists(episode), "an un-reviewed show's files must leave the library");
+            Assert.False(Directory.Exists(Path.Combine(TempDir.Path, "Shows", "Established Show")));
+            Assert.DoesNotContain("7", config.ReviewedSeriesIdsJson);
+            Assert.Empty(config.ExcludedSeriesIds);
+            Assert.Contains("7", config.UnreviewedSeriesIdsJson);
+            Assert.Equal(0, svc.SeriesProgress.Failed);
+            // The gate held it before the detail fetch — nothing to fetch for a held show.
+            Assert.DoesNotContain(Handler.ReceivedUrls, u => u.Contains("get_series_info&series_id=7"));
+        }
+
+        /// <summary>
         /// The series-specific marker. Series carry no TMDB ID on the list payload, so a stored
         /// episode hash — keyed on SeriesId — is the second piece of evidence that a show was
         /// synced before. It survives the provider renaming the show, which folder-name matching

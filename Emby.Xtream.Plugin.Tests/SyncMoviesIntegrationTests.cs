@@ -425,6 +425,99 @@ namespace Emby.Xtream.Plugin.Tests
         }
 
         // -----------------------------------------------------------------
+        // Review gate — deliberate un-review (ADR-F008)
+        // -----------------------------------------------------------------
+
+        [Fact]
+        public async Task ReviewGate_DeliberatelyUnreviewedOnDiskTitle_HeldAndFilesRemoved()
+        {
+            // The bug this section pins: without the tombstone, the on-disk exemption read the
+            // title's own folder as "the user already keeps this" and re-reviewed it on the
+            // very next sync — so an un-review never persisted and the files never left.
+            var config = DefaultConfig();
+            config.RequireReviewBeforeSync = true;
+            config.ReviewedVodStreamIdsJson = "[]";
+            config.UnreviewedVodStreamIdsJson = "[8]";
+
+            var existing = MovieStrmPath("Established Movie");
+            Directory.CreateDirectory(Path.GetDirectoryName(existing));
+            File.WriteAllText(existing, "http://fake-xtream/movie/user/pass/8.mkv");
+
+            RegisterVodStreams(VodStreamsJson(
+                VodStream(streamId: 8, name: "Established Movie", added: 1000)));
+
+            var svc = MakeService();
+            await svc.SyncMoviesAsync(config, None, SaveConfig);
+
+            Assert.False(File.Exists(existing), "an un-reviewed title's files must leave the library");
+            // The un-review must survive the run: not resurrected into the reviewed set...
+            Assert.DoesNotContain("8", config.ReviewedVodStreamIdsJson);
+            // ...not silently turned into an exclusion the user never made...
+            Assert.Empty(config.ExcludedVodStreamIds);
+            // ...and the tombstone itself must still be there.
+            Assert.Contains("8", config.UnreviewedVodStreamIdsJson);
+            Assert.Equal(0, svc.MovieProgress.Failed);
+        }
+
+        [Fact]
+        public async Task ReviewGate_UnreviewThenReReviewed_PersistsAcrossSyncsAndComesBack()
+        {
+            // The user's exact sequence: keep, un-review (Save + Sync), re-review — across
+            // three runs. The stream response is registered as a sequence because
+            // FakeHttpHandler responses are single-shot.
+            var config = DefaultConfig();
+            config.RequireReviewBeforeSync = true;
+            var json = VodStreamsJson(VodStream(streamId: 8, name: "Established Movie", added: 1000));
+            Handler.RespondWithSequence("get_vod_streams", new[] { json, json, json });
+
+            // Run 1: reviewed and kept.
+            config.ReviewedVodStreamIdsJson = "[8]";
+            await MakeService().SyncMoviesAsync(config, None, SaveConfig);
+            Assert.True(File.Exists(MovieStrmPath("Established Movie")));
+
+            // The de-dup view's Save after un-ticking "reviewed": reviewed mark out,
+            // tombstone in.
+            config.ReviewedVodStreamIdsJson = "[]";
+            config.UnreviewedVodStreamIdsJson = "[8]";
+            await MakeService().SyncMoviesAsync(config, None, SaveConfig);
+            Assert.False(File.Exists(MovieStrmPath("Established Movie")), "un-reviewed files must be removed");
+            Assert.DoesNotContain("8", config.ReviewedVodStreamIdsJson);
+
+            // Re-review: tombstone out, reviewed mark in — and the title returns.
+            config.ReviewedVodStreamIdsJson = "[8]";
+            config.UnreviewedVodStreamIdsJson = "[]";
+            await MakeService().SyncMoviesAsync(config, None, SaveConfig);
+            Assert.True(File.Exists(MovieStrmPath("Established Movie")));
+        }
+
+        [Fact]
+        public async Task ReviewGate_UnparseableTombstoneStore_ExemptionStandsDown()
+        {
+            // A tombstone store that will not parse must not resume the on-disk exemption:
+            // guessing "nothing is tombstoned" would resurrect every deliberate un-review.
+            // Holding is the reversible direction — the on-disk title waits in the review
+            // queue until the field is repaired.
+            var config = DefaultConfig();
+            config.RequireReviewBeforeSync = true;
+            config.ReviewedVodStreamIdsJson = "[]";
+            config.UnreviewedVodStreamIdsJson = "[8";
+
+            var existing = MovieStrmPath("Established Movie");
+            Directory.CreateDirectory(Path.GetDirectoryName(existing));
+            File.WriteAllText(existing, "http://fake-xtream/movie/user/pass/8.mkv");
+
+            RegisterVodStreams(VodStreamsJson(
+                VodStream(streamId: 8, name: "Established Movie", added: 1000)));
+
+            var svc = MakeService();
+            await svc.SyncMoviesAsync(config, None, SaveConfig);
+
+            Assert.True(File.Exists(existing), "a held title's files are only removed once the un-review is known");
+            Assert.DoesNotContain("8", config.ReviewedVodStreamIdsJson);
+            Assert.Equal(0, svc.MovieProgress.Failed);
+        }
+
+        // -----------------------------------------------------------------
         // Per-item exclusion (issue #57)
         // -----------------------------------------------------------------
 

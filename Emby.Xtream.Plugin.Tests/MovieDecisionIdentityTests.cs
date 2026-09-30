@@ -27,8 +27,10 @@ namespace Emby.Xtream.Plugin.Tests
             HashSet<int> excluded,
             HashSet<int> reviewed,
             Dictionary<int, int> map,
-            bool allowRepoint = true) =>
-            StrmSyncService.ReconcileMovieDecisionIdentity(live, excluded, reviewed, map, allowRepoint, Sample);
+            bool allowRepoint = true,
+            HashSet<int> unreviewed = null) =>
+            StrmSyncService.ReconcileMovieDecisionIdentity(
+                live, excluded, reviewed, unreviewed ?? new HashSet<int>(), map, allowRepoint, Sample);
 
         // ---- Backfill: the migration, run incrementally against the live catalogue ----
 
@@ -108,6 +110,43 @@ namespace Emby.Xtream.Plugin.Tests
 
             Assert.Equal(1, outcome.RepointedReviews);
             Assert.Contains(900, reviewed);
+        }
+
+        [Fact]
+        public void Repoint_CarriesAnUnreviewTombstoneOntoTheReIssuedStreamId()
+        {
+            // The user un-reviewed a title, and the provider then re-issued its id. Without
+            // carrying the tombstone across, the new id looks merely un-reviewed, and the
+            // review gate's on-disk exemption would read the still-existing folder as "the
+            // user keeps this" — resurrecting the decision that was withdrawn.
+            var unreviewed = new HashSet<int> { 100 };
+            var map = new Dictionary<int, int> { { 100, 603 } };
+
+            var outcome = Run(
+                new[] { Vod(900, 603) }, new HashSet<int>(), new HashSet<int>(), map, unreviewed: unreviewed);
+
+            Assert.Equal(1, outcome.RepointedUnreviews);
+            Assert.Contains(900, unreviewed);
+            // The tombstone is a live decision, so its identity record moved with it.
+            Assert.Equal(603, map[900]);
+        }
+
+        [Fact]
+        public void Repoint_DeclinesAnUnreviewOntoAnIdTheUserHasSinceReviewedAndKept()
+        {
+            // Old un-review, then a rotation, then the user re-reviewed the title under its
+            // new id. The newer decision wins: a carried tombstone would hold a title out of
+            // the library that the user just explicitly re-approved.
+            var unreviewed = new HashSet<int> { 100 };
+            var reviewed = new HashSet<int> { 900 };
+            var map = new Dictionary<int, int> { { 100, 603 } };
+
+            var outcome = Run(
+                new[] { Vod(900, 603) }, new HashSet<int>(), reviewed, map, unreviewed: unreviewed);
+
+            Assert.Equal(0, outcome.RepointedUnreviews);
+            Assert.DoesNotContain(900, unreviewed);
+            Assert.Equal(0, outcome.MovedTitles);
         }
 
         [Fact]

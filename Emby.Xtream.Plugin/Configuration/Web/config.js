@@ -49,6 +49,11 @@ function (BaseView, loading) {
         // (kept as id→true maps for O(1) membership; persisted as JSON id arrays).
         this.reviewedVodStreamIds = {};
         this.reviewedSeriesIds = {};
+        // Deliberate-unreview tombstones (ADR-F008): ids the user explicitly marked
+        // un-reviewed. The sync's on-disk exemption would otherwise re-review them on the
+        // next run, so the page records the withdrawal alongside the reviewed store.
+        this.unreviewedVodStreamIds = {};
+        this.unreviewedSeriesIds = {};
         this.dedupedVod = [];
         this.dedupedSeries = [];
         // De-dup view filters (session-only, reset each load). Show: 'all' | 'included' |
@@ -436,20 +441,23 @@ function (BaseView, loading) {
     View.prototype.onPause = function () {};
 
     // ---- Guarded stores ----
-    // The four fields holding every keep/exclude/review decision the user has ever made:
-    // two int[] blocklists and two JSON reviewed checkpoints, ~70,000 ids between them on a
-    // mature install. They all round-trip through this page — read into `instance` at load,
-    // written back out on every save, including saves that only touched an unrelated
-    // checkbox. So a store that fails to READ and then reads as "empty" is not a display
-    // bug: it is a silent, total loss of the user's decisions on the very next save.
+    // The six fields holding every keep/exclude/review decision the user has ever made:
+    // two int[] blocklists, two JSON reviewed checkpoints and two JSON un-review
+    // tombstones, ~70,000 ids between them on a mature install. They all round-trip
+    // through this page — read into `instance` at load, written back out on every save,
+    // including saves that only touched an unrelated checkbox. So a store that fails to
+    // READ and then reads as "empty" is not a display bug: it is a silent, total loss of
+    // the user's decisions on the very next save.
     //
     // Table-driven so load, save and the overwrite prompt can never disagree about which
     // fields are guarded. `label` is user-facing.
     var GUARDED_STORES = [
         { key: 'excludedVodStreamIds', configKey: 'ExcludedVodStreamIds', label: 'the movie exclusion list' },
         { key: 'reviewedVodStreamIds', configKey: 'ReviewedVodStreamIdsJson', label: 'the movie reviewed list' },
+        { key: 'unreviewedVodStreamIds', configKey: 'UnreviewedVodStreamIdsJson', label: 'the movie unreviewed list' },
         { key: 'excludedSeriesIds', configKey: 'ExcludedSeriesIds', label: 'the series exclusion list' },
-        { key: 'reviewedSeriesIds', configKey: 'ReviewedSeriesIdsJson', label: 'the series reviewed list' }
+        { key: 'reviewedSeriesIds', configKey: 'ReviewedSeriesIdsJson', label: 'the series reviewed list' },
+        { key: 'unreviewedSeriesIds', configKey: 'UnreviewedSeriesIdsJson', label: 'the series unreviewed list' }
     ];
 
     function findGuardedStore(key) {
@@ -612,6 +620,8 @@ function (BaseView, loading) {
                 parseExcludedList(config.ExcludedVodStreamIds), [], storeProblems);
             adoptStore(instance, 'reviewedVodStreamIds',
                 parseReviewedSet(config.ReviewedVodStreamIdsJson), {}, storeProblems);
+            adoptStore(instance, 'unreviewedVodStreamIds',
+                parseReviewedSet(config.UnreviewedVodStreamIdsJson), {}, storeProblems);
 
             // Series
             view.querySelector('.chkSyncSeries').checked = !!config.SyncSeries;
@@ -624,6 +634,8 @@ function (BaseView, loading) {
                 parseExcludedList(config.ExcludedSeriesIds), [], storeProblems);
             adoptStore(instance, 'reviewedSeriesIds',
                 parseReviewedSet(config.ReviewedSeriesIdsJson), {}, storeProblems);
+            adoptStore(instance, 'unreviewedSeriesIds',
+                parseReviewedSet(config.UnreviewedSeriesIdsJson), {}, storeProblems);
 
             // Update channel
             view.querySelector('.chkUseBetaChannel').checked = !!config.UseBetaChannel;
@@ -752,6 +764,8 @@ function (BaseView, loading) {
                 function (v) { return v.slice(); });
             saveStore(instance, config, 'reviewedVodStreamIds', 'ReviewedVodStreamIdsJson',
                 serializeReviewedSet);
+            saveStore(instance, config, 'unreviewedVodStreamIds', 'UnreviewedVodStreamIdsJson',
+                serializeReviewedSet);
 
             // Series
             config.SyncSeries = view.querySelector('.chkSyncSeries').checked;
@@ -761,6 +775,8 @@ function (BaseView, loading) {
             saveStore(instance, config, 'excludedSeriesIds', 'ExcludedSeriesIds',
                 function (v) { return v.slice(); });
             saveStore(instance, config, 'reviewedSeriesIds', 'ReviewedSeriesIdsJson',
+                serializeReviewedSet);
+            saveStore(instance, config, 'unreviewedSeriesIds', 'UnreviewedSeriesIdsJson',
                 serializeReviewedSet);
 
             // Update channel
@@ -1721,6 +1737,8 @@ function updateEpgVisibility(view) {
                 excludeKey: 'excludedSeriesIds',
                 reviewedKey: 'reviewedSeriesIds',
                 reviewedJsonKey: 'ReviewedSeriesIdsJson',
+                unreviewedKey: 'unreviewedSeriesIds',
+                unreviewedJsonKey: 'UnreviewedSeriesIdsJson',
                 catsKey: 'loadedSeriesCategories'
             };
         }
@@ -1732,6 +1750,8 @@ function updateEpgVisibility(view) {
             excludeKey: 'excludedVodStreamIds',
             reviewedKey: 'reviewedVodStreamIds',
             reviewedJsonKey: 'ReviewedVodStreamIdsJson',
+            unreviewedKey: 'unreviewedVodStreamIds',
+            unreviewedJsonKey: 'UnreviewedVodStreamIdsJson',
             catsKey: 'loadedVodCategories'
         };
     }
@@ -1868,6 +1888,16 @@ function updateEpgVisibility(view) {
         if (!instance[cfg.reviewedKey]) instance[cfg.reviewedKey] = {};
         var local = instance[cfg.reviewedKey];
         Object.keys(serverSet).forEach(function (id) { local[id] = true; });
+
+        // The tombstones merge the same way (ADR-F008): the sync's identity pass can carry
+        // them onto re-issued ids server-side, and dropping those on Load would let the
+        // on-disk exemption resurrect an un-review the user made under the old id.
+        if (!cfg.unreviewedJsonKey) return;
+        var serverTombstones = parseReviewedSet(freshConfig[cfg.unreviewedJsonKey]);
+        if (serverTombstones === null) return;
+        if (!instance[cfg.unreviewedKey]) instance[cfg.unreviewedKey] = {};
+        var localTombstones = instance[cfg.unreviewedKey];
+        Object.keys(serverTombstones).forEach(function (id) { localTombstones[id] = true; });
     }
 
     function loadDeduped(instance, type) {
@@ -2209,8 +2239,10 @@ function updateEpgVisibility(view) {
         var ids = parseItemIds(cb.getAttribute('data-item-ids'));
         if (!instance[cfg.excludeKey]) instance[cfg.excludeKey] = [];
         if (!instance[cfg.reviewedKey]) instance[cfg.reviewedKey] = {};
+        if (!instance[cfg.unreviewedKey]) instance[cfg.unreviewedKey] = {};
         var list = instance[cfg.excludeKey];
         var reviewed = instance[cfg.reviewedKey];
+        var tombstones = instance[cfg.unreviewedKey];
         for (var i = 0; i < ids.length; i++) {
             var idx = list.indexOf(ids[i]);
             if (!cb.checked && idx === -1) {
@@ -2220,9 +2252,11 @@ function updateEpgVisibility(view) {
             } else if (cb.checked && idx !== -1) {
                 // Re-include: drop from the blocklist but keep it reviewed — the user has
                 // looked at this title and made a decision, so it should not resurface in
-                // the unreviewed worklist.
+                // the unreviewed worklist. Clearing the tombstone matters for the same
+                // reason: a stale one would hold the re-included title out of the sync.
                 list.splice(idx, 1);
                 reviewed[ids[i]] = true;
+                delete tombstones[ids[i]];
             }
         }
         // Restyle the row in place (excluded dimming / reviewed toggle) without a full
@@ -2269,15 +2303,27 @@ function updateEpgVisibility(view) {
     // alone (isTitleMarkedReviewed) rather than the derived union, so a partially excluded
     // row's toggle still works — see the note there. Marking still writes every id in the
     // row, which is what keeps the stored set group-complete under the ANY read rule.
+    //
+    // Un-reviewing also writes the ADR-F008 tombstone: the sync's on-disk exemption would
+    // otherwise read the title's still-existing folder as "the user already keeps this" and
+    // re-mark it reviewed on the next run — the exact resurrection this pair of stores ends.
+    // Re-reviewing clears the tombstone for the same ids.
     function toggleTitleReviewed(instance, type, ids, row) {
         if (!ids || !ids.length) return;
         var cfg = dedupedConfig(type);
         if (!instance[cfg.reviewedKey]) instance[cfg.reviewedKey] = {};
+        if (!instance[cfg.unreviewedKey]) instance[cfg.unreviewedKey] = {};
         var reviewed = instance[cfg.reviewedKey];
+        var tombstones = instance[cfg.unreviewedKey];
         var isRev = isTitleMarkedReviewed(instance, cfg, ids);
         for (var i = 0; i < ids.length; i++) {
-            if (isRev) delete reviewed[ids[i]];
-            else reviewed[ids[i]] = true;
+            if (isRev) {
+                delete reviewed[ids[i]];
+                tombstones[ids[i]] = true;
+            } else {
+                reviewed[ids[i]] = true;
+                delete tombstones[ids[i]];
+            }
         }
         if (row) restyleDedupedRow(instance, type, row, ids);
         refreshDedupedTallies(instance, type);
@@ -2438,11 +2484,16 @@ function updateEpgVisibility(view) {
         var cfg = dedupedConfig(type);
         var matches = instance[cfg.prefix + 'DedupedMatches'] || [];
         if (!instance[cfg.reviewedKey]) instance[cfg.reviewedKey] = {};
+        if (!instance[cfg.unreviewedKey]) instance[cfg.unreviewedKey] = {};
         var reviewed = instance[cfg.reviewedKey];
+        var tombstones = instance[cfg.unreviewedKey];
         if (!confirmBulk(matches.length, 'mark titles reviewed')) return;
         for (var i = 0; i < matches.length; i++) {
             var ids = matches[i].Ids || [];
-            for (var k = 0; k < ids.length; k++) { reviewed[ids[k]] = true; }
+            for (var k = 0; k < ids.length; k++) {
+                reviewed[ids[k]] = true;
+                delete tombstones[ids[k]];
+            }
         }
         refreshDedupedRowsInPlace(instance, type);
     }
@@ -2456,11 +2507,16 @@ function updateEpgVisibility(view) {
         var cfg = dedupedConfig(type);
         var matches = instance[cfg.prefix + 'DedupedMatches'] || [];
         if (!instance[cfg.reviewedKey]) instance[cfg.reviewedKey] = {};
+        if (!instance[cfg.unreviewedKey]) instance[cfg.unreviewedKey] = {};
         var reviewed = instance[cfg.reviewedKey];
+        var tombstones = instance[cfg.unreviewedKey];
         if (!confirmBulk(matches.length, 'clear the reviewed mark')) return;
         for (var i = 0; i < matches.length; i++) {
             var ids = matches[i].Ids || [];
-            for (var k = 0; k < ids.length; k++) { delete reviewed[ids[k]]; }
+            for (var k = 0; k < ids.length; k++) {
+                delete reviewed[ids[k]];
+                tombstones[ids[k]] = true;
+            }
         }
         refreshDedupedRowsInPlace(instance, type);
     }
