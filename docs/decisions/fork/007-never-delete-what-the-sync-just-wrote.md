@@ -4,7 +4,9 @@
 upstream ADR — see [README.md](README.md).)*
 
 **Date**: 2026-09-12
-**Status**: ACCEPTED
+**Status**: ACCEPTED — implementation converged with upstream's
+[ADR-018](../018-exclusion-never-deletes-what-the-sync-wrote.md) in the 2026-10 upstream merge;
+their fix is the one in force, in `StrmSyncService.Cleanup.cs`
 **Affects**: `StrmSyncService.RemoveExcludedContent` (one new parameter and one guard),
 both sync call sites
 

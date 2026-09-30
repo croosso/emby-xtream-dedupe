@@ -8,6 +8,37 @@ starting at 1.0.0 — independent of upstream
 
 ## [Unreleased]
 
+### Changed
+
+- **Picked up upstream's changes through `91f27d3` (30 commits).** Everything they shipped since
+  the September merge is now in: honest sync counts (failures are no longer reported as writes),
+  failed series are actually retried by the next sync and by "Retry failed items" instead of
+  being dropped, series whose episode list came back empty are retried once before counting as
+  empty, specials (Season 0 / Episode 0) stay in the Specials folder, category lists that failed
+  to load no longer look like "no categories", the Danger Zone buttons work, and the library is
+  refreshed after a sync that changed files — including a sync that failed part-way through.
+  Where both projects had built the same thing, one implementation was kept: their delete-safety
+  guard replaces this fork's equivalent (their tests cover the same property), and their
+  refinement of this fork's episode-detail retry (one retry, not three) is adopted with it.
+  Their delete code also moved into `StrmSyncService.Cleanup.cs`, so this fork's deletion
+  recording, rollback copies, catalogue snapshots and episode-filename migration moved there
+  with it.
+
+- **One release file for both Emby versions.** Upstream now compile `AddConsumer`/`RemoveConsumer`
+  into every build, so the 4.9 build loads on Emby 4.10 too, and the release ships the same file
+  under both names. The 4.10-specific download and the rename-before-installing dance are gone;
+  existing installs update to a file that loads either way. The 4.10 SDK is still compiled and
+  tested on every build — it just no longer produces a second release file.
+
+### Fixed
+
+- **Un-reviewing a movie now sticks (ADR-F008).** Marking a title "unreviewed" and saving looked
+  like it worked — until the next sync quietly re-marked it reviewed, because the sync treated
+  its still-existing folder as proof you wanted to keep it, and the "reviewed" tag came back on
+  refresh. Un-reviewing now records the decision, and with "Only sync what you have reviewed"
+  on, the title's files leave the library on the next sync and the title returns to your review
+  queue. Reviewing it again brings it back. Series work the same way.
+
 ## [1.8.0] - 2026-09-16
 
 ### Added
