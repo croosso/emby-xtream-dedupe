@@ -2,9 +2,11 @@
 # Fork-owned full build: both Emby targets, both test configurations, and the guards CI runs.
 #
 # Emby.Xtream.Plugin/build.sh is shared with upstream and is 4.9-only on both counts — it runs
-# `dotnet test` with no -c (so Debug, i.e. the 4.9 path) and publishes `-c Release`. That leaves
-# the 4.10 DLL, which every release ships, built by nothing but the release workflow and tested
-# by nothing but CI. This wrapper closes that without editing the shared script.
+# `dotnet test` with no -c (so Debug, i.e. the 4.9 path) and publishes `-c Release`. Since
+# upstream's single-DLL change (their ADR-017), that one build is what releases ship on both
+# Emby versions; this wrapper keeps the 4.10 SDK compiled and tested against the real test
+# suite (upstream's release workflow only compiles it and runs a load check), and publishes it
+# to out_4_10 as a locally buildable verification artifact.
 #
 # Run from anywhere:  bash build-dedupe.sh
 set -euo pipefail
@@ -82,15 +84,12 @@ ls -la "$PLUGIN_DIR/out/Emby.Xtream.Plugin.dll" "$OUT_4_10/Emby.Xtream.Plugin.dl
 
 cat <<EOF
 
-Deploy ONE of these, never both:
+Deploy the single-DLL build — it loads on Emby 4.9 and 4.10 alike (upstream ADR-017):
 
-  Emby 4.9.x         docker cp $PLUGIN_DIR/out/Emby.Xtream.Plugin.dll <container>:/config/plugins/
-  Emby 4.10.0.17+    docker cp $OUT_4_10/Emby.Xtream.Plugin.dll <container>:/config/plugins/
+  docker cp $PLUGIN_DIR/out/Emby.Xtream.Plugin.dll <container>:/config/plugins/
 
 Then: docker restart <container>
 
-Note both files are already named Emby.Xtream.Plugin.dll, which is what Emby needs — it names
-each plugin's settings file after the DLL, so installing one under any other name gives it a
-separate, empty configuration. Only the published RELEASE asset carries a -4.10 suffix, and that
-one has to be renamed on install.
+$OUT_4_10/Emby.Xtream.Plugin.dll is the 4.10-SDK verification build. It is compiled and tested
+here so that SDK cannot drift, but releases ship the 4.9-SDK build above under both asset names.
 EOF

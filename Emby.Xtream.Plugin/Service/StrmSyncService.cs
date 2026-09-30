@@ -147,7 +147,7 @@ namespace Emby.Xtream.Plugin.Service
         public DateTime FailedAt { get; set; } = DateTime.UtcNow;
     }
 
-    public class StrmSyncService
+    public partial class StrmSyncService
     {
         private static readonly STJ.JsonSerializerOptions JsonOptions = new STJ.JsonSerializerOptions
         {
@@ -202,7 +202,10 @@ namespace Emby.Xtream.Plugin.Service
         { Timeout = TimeSpan.FromSeconds(30) };
 
         // Increment when naming logic changes so existing installs force a full re-sync on next run.
-        internal const int CurrentStrmNamingVersion = 1;
+        // 2: specials moved from Season 01 / E01 to Season 00 / E00. The episode hash only covers
+        // episode IDs, so without the bump shows with misplaced specials would be skipped as
+        // unchanged and never corrected.
+        internal const int CurrentStrmNamingVersion = 2;
 
         // Increment when episode filenames change shape so existing libraries are renamed
         // in place rather than rewritten. See MigrateEpisodeFilenames.
@@ -228,10 +231,15 @@ namespace Emby.Xtream.Plugin.Service
         private SyncProgress _seriesProgress = new SyncProgress();
         private SyncProgress _episodeProgress = new SyncProgress();
 
-        // get_series_info retry tuning (see FetchSeriesDetailAsync). Internal so tests can
-        // zero the delay; prod defaults re-fetch a transient empty episode list a few times.
-        internal int SeriesDetailMaxAttempts = 3;
-        internal int SeriesDetailRetryBaseDelayMs = 500;
+        // Delay before re-fetching an empty get_series_info answer (see
+        // FetchSeriesDetailAsync). Internal so tests can set it to zero. Originally from
+        // andyj682/emby-xtream-dedupe (ff63da3), refined upstream to a single retry.
+        internal int SeriesDetailRetryDelayMs = 1000;
+
+        // Replaces the call into Emby's library monitor (upstream's test hook for
+        // NotifyEmbyLibraryChanged); tests set it to see what would be reported. Null in
+        // production.
+        internal Action<string> LibraryChangedNotifier { get; set; }
 
         /// <summary>
         /// Where the full deleted-path record is written when a cleanup removes more than the
@@ -1323,39 +1331,6 @@ namespace Emby.Xtream.Plugin.Service
         }
 
         /// <summary>
-        /// Keeps the most recent <paramref name="keep"/> dated snapshots.
-        /// </summary>
-        private void PruneCatalogueSnapshots(string directory, int keep)
-        {
-            var files = Directory.GetFiles(directory, "catalogue-ids-*.tsv");
-            if (files.Length <= keep)
-            {
-                return;
-            }
-
-            // ISO dates sort chronologically as text, so ordinal order is oldest-first.
-            Array.Sort(files, StringComparer.Ordinal);
-
-            for (var i = 0; i < files.Length - keep; i++)
-            {
-                try
-                {
-                    // delete-ok: prunes this plugin's own dated catalogue listings from the
-                    // "snapshots" folder it created. These are TSV files the plugin wrote
-                    // itself, never library content. The glob matches only its own
-                    // "catalogue-ids-*.tsv" naming, so a copy the user has deliberately
-                    // preserved by renaming it with a prefix is immune — the same escape the
-                    // external script's prune leaves open, and the one that saved a recovery.
-                    File.Delete(files[i]);
-                }
-                catch (Exception ex)
-                {
-                    _logger.Debug("Could not prune old snapshot '{0}': {1}", files[i], ex.Message);
-                }
-            }
-        }
-
-        /// <summary>
         /// The last non-empty line of a file, read from the tail rather than the whole file — the
         /// counts log is append-only and never pruned, so checking one line must not mean loading
         /// years of them.
@@ -2029,6 +2004,56 @@ namespace Emby.Xtream.Plugin.Service
         }
 
         /// <summary>
+        /// Tells Emby that the Movies or Shows folder changed, so content this sync wrote or
+        /// removed shows up without waiting for a scheduled scan. Only when files were actually
+        /// added or removed: a sync that changed nothing must not make Emby scan (or wake the
+        /// disk). The folder is the one users add to Emby as a library, and it also covers the
+        /// category subfolders of the multiple and custom folder modes.
+        ///
+        /// Reports the change rather than starting a library scan, so Emby refreshes only that
+        /// folder. A failure is logged and ignored: the files are already correct and the
+        /// scheduled scan still picks them up. From andyj682/emby-xtream-dedupe (771ac8c).
+        /// </summary>
+        private void NotifyEmbyLibraryChanged(PluginConfiguration config, string rootFolder, int added, int deleted)
+        {
+            if (!config.RefreshEmbyLibraryAfterSync || (added <= 0 && deleted <= 0))
+            {
+                return;
+            }
+
+            var path = Path.Combine(config.StrmLibraryPath ?? string.Empty, rootFolder);
+            if (LibraryChangedNotifier != null)
+            {
+                LibraryChangedNotifier(path);
+                return;
+            }
+
+            // Null outside a running Emby.
+            var host = Plugin.InstanceOrNull?.ApplicationHost;
+            if (host == null)
+            {
+                return;
+            }
+
+            try
+            {
+                var monitor = host.Resolve<ILibraryMonitor>();
+                if (monitor == null)
+                {
+                    _logger.Warn("Library refresh: Emby's library monitor is not available; '{0}' is picked up by the next scheduled scan", path);
+                    return;
+                }
+
+                monitor.ReportFileSystemChanged(path);
+                _logger.Info("Library refresh: told Emby that '{0}' changed ({1} added, {2} removed)", path, added, deleted);
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn("Library refresh failed for '{0}': {1}", path, ex.Message);
+            }
+        }
+
+        /// <summary>
         /// Checks whether the stored STRM naming version is current. If not, resets sync timestamps
         /// so the next run performs a full re-sync and regenerates files with corrected names.
         /// Returns true when a version upgrade was applied (timestamps were reset), false otherwise.
@@ -2047,153 +2072,6 @@ namespace Emby.Xtream.Plugin.Service
             config.SeriesEpisodeHashesJson = string.Empty;
             saveConfig?.Invoke();
             return true;
-        }
-
-        /// <summary>
-        /// Tells Emby that a library folder changed, so newly written content appears without
-        /// waiting for a scheduled scan.
-        ///
-        /// Only called when the sync actually added or removed files: an unchanged run must not
-        /// trigger a scan, or every no-op sync would spin the library (and the disk) for nothing.
-        /// The path is the library root this sync writes to — <c>{StrmLibraryPath}/Movies</c> or
-        /// <c>/Shows</c> — which is what the user adds to Emby as a library, and which also
-        /// covers Multiple/Custom folder mode since those write category subfolders beneath it.
-        ///
-        /// Reports the change rather than forcing a full validation: Emby coalesces the report
-        /// and refreshes just that subtree, where a full library validation would scan
-        /// everything including libraries this plugin has nothing to do with.
-        /// </summary>
-        private void NotifyEmbyLibraryChanged(
-            PluginConfiguration config, string rootFolderName, int added, int deleted)
-        {
-            if (!config.RefreshEmbyLibraryAfterSync) return;
-            if (added <= 0 && deleted <= 0) return;
-
-            // Null outside a running Emby (unit tests construct the service directly).
-            var host = Plugin.InstanceOrNull?.ApplicationHost;
-            if (host == null) return;
-
-            var path = Path.Combine(config.StrmLibraryPath ?? string.Empty, rootFolderName);
-
-            try
-            {
-                var monitor = host.Resolve<ILibraryMonitor>();
-                if (monitor == null)
-                {
-                    _logger.Warn(
-                        "Library refresh: Emby's library monitor was not available — '{0}' will be picked up by the next scheduled scan",
-                        path);
-                    return;
-                }
-
-                monitor.ReportFileSystemChanged(path);
-                _logger.Info(
-                    "Library refresh: notified Emby that '{0}' changed ({1} added, {2} removed)",
-                    path, added, deleted);
-            }
-            catch (Exception ex)
-            {
-                // Never fail a sync over this — the files are already written correctly, and
-                // Emby's scheduled scan remains the backstop.
-                _logger.Warn("Library refresh failed for '{0}': {1}", path, ex.Message);
-            }
-        }
-
-        /// <summary>
-        /// One-time rename of episode STRM files from the old title-bearing form
-        /// ("Show - S01E02 - Some Title.strm") to the title-free form
-        /// ("Show - S01E02.strm").
-        ///
-        /// Renaming in place matters. Letting the sync converge on the new names instead
-        /// would write every episode afresh and orphan every old one — on a large library
-        /// that is an orphan ratio around 50%, far above
-        /// <see cref="PluginConfiguration.OrphanSafetyThreshold"/>, so cleanup would refuse
-        /// and the tree would carry two copies of everything until someone raised the
-        /// threshold by hand.
-        ///
-        /// Deliberately does NOT touch the delta watermark or the stored episode hashes
-        /// (unlike <see cref="CheckAndUpgradeNamingVersion"/>): the files land exactly where
-        /// the next sync expects them, so nothing needs re-fetching.
-        /// </summary>
-        /// <returns>Number of files renamed or removed.</returns>
-        internal int MigrateEpisodeFilenames(PluginConfiguration config, Action saveConfig)
-        {
-            if (config.EpisodeFilenameMigrationVersion >= CurrentEpisodeFilenameVersion)
-                return 0;
-
-            var showsRoot = Path.Combine(config.StrmLibraryPath ?? string.Empty, "Shows");
-            var renamed = 0;
-            var collapsed = 0;
-
-            if (Directory.Exists(showsRoot))
-            {
-                // Runs once, but walks the whole tree — surface it rather than leaving an
-                // unexplained pause at the start of the sync.
-                _seriesProgress.Phase = "Migrating episode filenames";
-
-                string[] files;
-                try
-                {
-                    files = Directory.GetFiles(showsRoot, "*.strm", SearchOption.AllDirectories);
-                }
-                catch (Exception ex)
-                {
-                    // Leave the version unset so the migration is retried next run rather
-                    // than being silently skipped on a transient I/O error.
-                    _logger.Warn("Episode filename migration: could not scan '{0}': {1}", showsRoot, ex.Message);
-                    return 0;
-                }
-
-                foreach (var path in files)
-                {
-                    var match = TitledEpisodeFileRegex.Match(Path.GetFileNameWithoutExtension(path) ?? string.Empty);
-                    if (!match.Success) continue;
-
-                    // Only touch files this plugin wrote — the same guard orphan cleanup uses,
-                    // so a hand-placed .strm that happens to match the pattern is left alone.
-                    if (!StrmOwnership.IsOwnedStrm(path, config.BaseUrl, config.DispatcharrUrl)) continue;
-
-                    var dir = Path.GetDirectoryName(path);
-                    if (string.IsNullOrEmpty(dir)) continue;
-                    var target = Path.Combine(dir, match.Groups["base"].Value + ".strm");
-
-                    try
-                    {
-                        if (File.Exists(target))
-                        {
-                            // Both forms already present — the pair of files this change exists
-                            // to prevent. The title-free one is canonical and the next sync
-                            // corrects its URL if it differs, so drop the titled twin.
-                            // delete-ok: the loop skips every path StrmOwnership.IsOwnedStrm
-                            // rejects, so this only ever removes a STRM the plugin wrote, and
-                            // only when the file it would have been renamed to already exists.
-                            File.Delete(path);
-                            collapsed++;
-                        }
-                        else
-                        {
-                            File.Move(path, target);
-                            renamed++;
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.Warn("Episode filename migration: could not rename '{0}': {1}", path, ex.Message);
-                    }
-                }
-            }
-
-            config.EpisodeFilenameMigrationVersion = CurrentEpisodeFilenameVersion;
-            saveConfig?.Invoke();
-
-            if (renamed > 0 || collapsed > 0)
-            {
-                _logger.Info(
-                    "Episode filename migration: renamed {0} file(s) to the title-free form, removed {1} duplicate(s)",
-                    renamed, collapsed);
-            }
-
-            return renamed + collapsed;
         }
 
         /// <summary>
@@ -2424,6 +2302,9 @@ namespace Emby.Xtream.Plugin.Service
                 var writtenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 var semaphore = new SemaphoreSlim(ResolveSyncParallelism(config));
 
+                // Counted at the write: Completed minus Skipped counted failures as writes.
+                int moviesWrittenCount = 0;
+
                 // Shared Dispatcharr VOD client — only queried per-movie, after smart-skip
                 Emby.Xtream.Plugin.Client.DispatcharrClient dispatcharrVodClient = null;
                 if (config.EnableDispatcharr && !string.IsNullOrEmpty(config.DispatcharrUrl))
@@ -2435,6 +2316,7 @@ namespace Emby.Xtream.Plugin.Service
                 var tasks = allStreams.Select(async movie =>
                 {
                     await semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    string movieDirForFailure = null;
                     try
                     {
                         var cleanedName = config.EnableContentNameCleaning
@@ -2542,6 +2424,7 @@ namespace Emby.Xtream.Plugin.Service
                         }
 
                         var movieDir = Path.Combine(config.StrmLibraryPath, subFolder, folderName);
+                        movieDirForFailure = movieDir;
                         var strmPath = Path.Combine(movieDir, folderName + ".strm");
 
                         // Smart skip: if file already exists AND the movie is not new (delta), skip
@@ -2660,12 +2543,18 @@ namespace Emby.Xtream.Plugin.Service
                             catch (Exception ex) { _logger.Debug("NFO write failed for '{0}': {1}", movie.Name, ex.Message); }
                         }
 
+                        Interlocked.Increment(ref moviesWrittenCount);
                         Interlocked.Increment(ref _movieProgress.Completed);
                         ReportTaskProgress(_movieProgress, taskProgress);
                     }
                     catch (Exception ex)
                     {
                         _logger.Error("Failed to write STRM for movie '{0}': [{1}] {2}", movie.Name, ex.GetType().Name, ex.Message);
+
+                        // Keep what an earlier sync wrote for this movie in writtenPaths, so the
+                        // exclusion pass treats its folder as in use (ADR-018). Orphan cleanup is
+                        // unaffected: it does not run on a sync with a failed item.
+                        RecordExistingStrms(movieDirForFailure, writtenPaths);
                         lock (_failedItemsLock)
                         {
                             _failedItems.Add(new FailedSyncItem
@@ -2733,35 +2622,55 @@ namespace Emby.Xtream.Plugin.Service
                 // cleanup and independent of it — see RemoveExcludedContent remarks.
                 // Note both passes accumulate into Deleted, which therefore counts folders
                 // (exclusions) and files (orphans) together. The dashboard shows one number.
+                // Postponed when a category failed to load: a kept title that shares an excluded
+                // title's folder is only protected by being in writtenPaths, and titles from that
+                // category never got there. A failed item is recorded there by its catch block,
+                // so item failures do not postpone exclusions (ADR-012, ADR-018).
                 if (excludedMovies.Count > 0)
                 {
-                    _movieProgress.Phase = "Removing excluded movies";
-                    _movieProgress.Deleted += RemoveExcludedContent(
-                        config, excludedMovies, config.MovieFolderMode, categoryNames, folderMappings, "Movies",
-                        writtenPaths);
+                    if (!vodFetch.HadFailures)
+                    {
+                        _movieProgress.Phase = "Removing excluded movies";
+                        _movieProgress.Deleted += RemoveExcludedContent(
+                            config, excludedMovies, config.MovieFolderMode, categoryNames, folderMappings, "Movies", writtenPaths);
+                    }
+                    else
+                    {
+                        _logger.Warn(
+                            "Removing excluded movies postponed to the next sync: a category failed to load");
+                    }
                 }
 
                 // Remove the files of titles deliberately un-reviewed this run (ADR-F008). The
                 // user withdrew a keep decision, so the files leave the library the same run
                 // rather than lingering as playback-ready leftovers. Same targeted pass and
                 // same safety contract as exclusions: only this plugin's own .strm/.nfo files,
-                // never a folder it cannot prove it wrote.
+                // never a folder it cannot prove it wrote. Postponed on a partial fetch for the
+                // same reason the exclusion pass above is.
                 if (unreviewedMovies.Count > 0)
                 {
-                    _movieProgress.Phase = "Removing un-reviewed movies";
-                    _movieProgress.Deleted += RemoveExcludedContent(
-                        config, unreviewedMovies, config.MovieFolderMode, categoryNames, folderMappings, "Movies",
-                        writtenPaths);
-                    var removedSample = unreviewedMovies
-                        .Select(m => m.Item1)
-                        .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
-                        .Take(HeldSampleSize)
-                        .ToList();
-                    _logger.Info(
-                        "Review gate: removed the files of {0} title(s) you had marked un-reviewed — they are back in the review queue: {1}{2}",
-                        unreviewedMovies.Count,
-                        string.Join(", ", removedSample),
-                        unreviewedMovies.Count > removedSample.Count ? ", ..." : string.Empty);
+                    if (!vodFetch.HadFailures)
+                    {
+                        _movieProgress.Phase = "Removing un-reviewed movies";
+                        _movieProgress.Deleted += RemoveExcludedContent(
+                            config, unreviewedMovies, config.MovieFolderMode, categoryNames, folderMappings, "Movies",
+                            writtenPaths);
+                        var removedSample = unreviewedMovies
+                            .Select(m => m.Item1)
+                            .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
+                            .Take(HeldSampleSize)
+                            .ToList();
+                        _logger.Info(
+                            "Review gate: removed the files of {0} title(s) you had marked un-reviewed — they are back in the review queue: {1}{2}",
+                            unreviewedMovies.Count,
+                            string.Join(", ", removedSample),
+                            unreviewedMovies.Count > removedSample.Count ? ", ..." : string.Empty);
+                    }
+                    else
+                    {
+                        _logger.Warn(
+                            "Removing un-reviewed movies postponed to the next sync: a category failed to load");
+                    }
                 }
 
                 // Cleanup orphans. Skipped when any category failed to answer: those titles are
@@ -2794,12 +2703,10 @@ namespace Emby.Xtream.Plugin.Service
                 }
 
                 _logger.Info("Movie STRM sync completed: {0} written, {1} skipped, {2} failed",
-                    _movieProgress.Completed - _movieProgress.Skipped, _movieProgress.Skipped, _movieProgress.Failed);
+                    moviesWrittenCount, _movieProgress.Skipped, _movieProgress.Failed);
 
                 // Logged after the write-back above, so the numbers are the post-sync state.
                 LogDecisionStoreSizes(config);
-
-                NotifyEmbyLibraryChanged(config, "Movies", _movieProgress.Added, _movieProgress.Deleted);
             }
             catch (Exception ex)
             {
@@ -2810,6 +2717,10 @@ namespace Emby.Xtream.Plugin.Service
             }
             finally
             {
+                // In the finally: a sync that wrote files and then failed on a later step still
+                // changed the library. A run that changed nothing reports nothing.
+                NotifyEmbyLibraryChanged(config, "Movies", _movieProgress.Added, _movieProgress.Deleted);
+
                 _movieProgress.IsRunning = false;
                 if (string.IsNullOrEmpty(_movieProgress.AbortReason))
                 {
@@ -2868,7 +2779,18 @@ namespace Emby.Xtream.Plugin.Service
             CheckAndUpgradeNamingVersion(config, saveConfig);
             _seriesProgress = new SyncProgress { IsRunning = true, Phase = "Starting series sync" };
             _episodeProgress = new SyncProgress { IsRunning = true };
-            lock (_failedItemsLock) { _failedItems.RemoveAll(i => i.ItemType == "Series"); }
+            // Series that failed last time are processed again whatever their LastModified says.
+            // The watermark moves past a series before its detail is fetched, so after a failed
+            // fetch it looks unchanged, and with smart skip on and its folder on disk it would be
+            // skipped without a fetch on every later run.
+            // The list itself is only cleared once the catalogue has loaded (below): a run that
+            // stops before then has not processed these series and must not forget them.
+            List<FailedSyncItem> previouslyFailedSeries;
+            lock (_failedItemsLock)
+            {
+                previouslyFailedSeries = _failedItems.Where(i => i.ItemType == "Series").ToList();
+            }
+            var forcedSeriesIds = new HashSet<int>(previouslyFailedSeries.Select(i => i.StreamId));
             var seriesSyncStart = DateTime.UtcNow;
             var seriesSyncSuccess = true;
             var addedSeriesTitles = new List<string>();
@@ -3112,6 +3034,37 @@ namespace Emby.Xtream.Plugin.Service
                     }
                 }
 
+                // The catalogue has loaded, so this run accounts for every previously failed series:
+                // it is processed below (and re-added if it fails again), or it is not listed.
+                lock (_failedItemsLock) { _failedItems.RemoveAll(i => i.ItemType == "Series"); }
+
+                if (forcedSeriesIds.Count > 0)
+                {
+                    var seenIds = new HashSet<int>(fetchedSeries.Select(x => x.SeriesId));
+                    var unseen = previouslyFailedSeries
+                        .Where(i => !seenIds.Contains(i.StreamId) && !ContentExclusionFilter.IsExcluded(excludedSeriesSet, i.StreamId))
+                        .ToList();
+                    if (unseen.Count > 0 && seriesFetch.HadFailures)
+                    {
+                        // Probably in a category that failed to load. It stays in the failed list;
+                        // orphan cleanup does not run on this sync, so its files are safe.
+                        _logger.Warn(
+                            "{0} series that failed last time were not seen because a category failed to load; they stay in the failed list: {1}",
+                            unseen.Count, string.Join(", ", unseen.Select(i => i.Name)));
+                        lock (_failedItemsLock) { _failedItems.AddRange(unseen); }
+                    }
+                    else if (unseen.Count > 0)
+                    {
+                        // Every category loaded, so the provider no longer lists them. They leave
+                        // the failed list and orphan cleanup treats them like any dropped series.
+                        _logger.Info(
+                            "{0} series that failed last time are no longer in the catalogue: {1}",
+                            unseen.Count, string.Join(", ", unseen.Select(i => i.Name)));
+                    }
+
+                    _logger.Info("Re-processing {0} series that failed last time", forcedSeriesIds.Count - unseen.Count);
+                }
+
                 // Delta sync: split into changed and unchanged using LastModified timestamp
                 var lastSeriesTs = config.LastSeriesSyncTimestamp;
                 long maxSeriesTs = lastSeriesTs;
@@ -3233,7 +3186,15 @@ namespace Emby.Xtream.Plugin.Service
                 // series is not getting the episodes you expect.
                 int preFetchSkippedCount = 0;
                 int unmappedSkippedCount = 0;
+
+                // Counted where they happen rather than derived afterwards: "written" used to be
+                // Completed minus Skipped, and failures increment Completed too, so they were
+                // reported as writes. From andyj682/emby-xtream-dedupe (575cb64, 048d7f2).
                 int writtenCount = 0;
+                // Series already explained elsewhere in the log (failed, unmapped, empty), which
+                // the "not checked this run" warning below leaves out.
+                var reportedSeriesIds = new ConcurrentDictionary<int, byte>();
+                var emptySeries = new ConcurrentBag<string>();
 
                 // Pre-fetch directory index: subFolder → {strippedSeriesName → fullDirPath}
                 // Built once before the parallel loop (one readdir per unique subfolder, no per-task races).
@@ -3267,6 +3228,8 @@ namespace Emby.Xtream.Plugin.Service
                 var tasks = allSeries.Select(async series =>
                 {
                     await semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    string seriesSubFolderForFailure = null;
+                    string seriesNameForFailure = null;
                     try
                     {
                         var cleanedName = config.EnableContentNameCleaning
@@ -3275,15 +3238,19 @@ namespace Emby.Xtream.Plugin.Service
                         var seriesName = SanitizeFileName(cleanedName);
                         if (string.IsNullOrWhiteSpace(seriesName))
                         {
+                            reportedSeriesIds[series.SeriesId] = 0;
                             Interlocked.Increment(ref _seriesProgress.Failed);
                             return;
                         }
 
                         var subFolder = BuildContentFolderPath(
                             config.SeriesFolderMode, series.CategoryId, categoryNames, folderMappings, "Shows");
+                        seriesSubFolderForFailure = subFolder;
+                        seriesNameForFailure = seriesName;
 
                         if (subFolder == null)
                         {
+                            reportedSeriesIds[series.SeriesId] = 0;
                             Interlocked.Increment(ref unmappedSkippedCount);
                             Interlocked.Increment(ref _seriesProgress.Skipped);
                             Interlocked.Increment(ref _seriesProgress.Completed);
@@ -3354,7 +3321,8 @@ namespace Emby.Xtream.Plugin.Service
                             lock (autoReviewed) { autoReviewed.Add(Tuple.Create(series.SeriesId, cleanedName)); }
                         }
 
-                        var isChangedSeries = lastSeriesTs == 0 || seriesLm > lastSeriesTs;
+                        var isForcedSeries = forcedSeriesIds.Contains(series.SeriesId);
+                        var isChangedSeries = lastSeriesTs == 0 || seriesLm > lastSeriesTs || isForcedSeries;
 
                         // Pre-fetch smart skip: for delta-unchanged series, locate folder on disk by name
                         // (avoids one get_series_info HTTP call per unchanged series)
@@ -3394,6 +3362,11 @@ namespace Emby.Xtream.Plugin.Service
                         catch (Exception ex)
                         {
                             _logger.Error("Failed to fetch detail for series '{0}' (id={1}): [{2}] {3}", series.Name, series.SeriesId, ex.GetType().Name, ex.Message);
+
+                            // Existing episodes still count as in use, so an exclusion that
+                            // matches this show's folder leaves it alone (ADR-018).
+                            RecordStrms(FindExistingSeriesStrms(config, subFolder, seriesName), writtenPaths);
+                            reportedSeriesIds[series.SeriesId] = 0;
                             lock (_failedItemsLock)
                             {
                                 _failedItems.Add(new FailedSyncItem
@@ -3430,20 +3403,35 @@ namespace Emby.Xtream.Plugin.Service
                                 _logger.Warn(
                                     "Series '{0}' (id={1}) returned no episodes but has {2} STRM file(s) on disk — keeping them and skipping orphan cleanup this run",
                                     series.Name, series.SeriesId, strandedStrms.Length);
+
+                                // In the failed list so the next sync fetches it again: the
+                                // watermark is already past it, so otherwise it is skipped as
+                                // unchanged until the provider touches it.
+                                lock (_failedItemsLock)
+                                {
+                                    _failedItems.Add(new FailedSyncItem
+                                    {
+                                        ItemType = "Series",
+                                        StreamId = series.SeriesId,
+                                        Name = series.Name,
+                                        CategoryId = series.CategoryId,
+                                        ErrorMessage = "Returned no episodes but has files on disk"
+                                    });
+                                }
                                 Interlocked.Increment(ref _seriesProgress.Failed);
                             }
                             else
                             {
                                 // No episodes and nothing on disk: nothing to write and nothing
-                                // to protect, so this branch used to return in complete silence
-                                // — the series simply vanished from the run. Most often a film
-                                // sitting in the series catalogue, or a title the provider has
-                                // not populated. Say so; excluding it stops the retry cost.
-                                _logger.Warn(
-                                    "Series '{0}' (id={1}) returned no episodes and has no files on disk — nothing to write. Exclude it to stop re-checking every sync.",
-                                    series.Name, series.SeriesId);
+                                // to protect. Most often a film sitting in the series catalogue,
+                                // or a title the provider has not populated. Reported in one
+                                // line after the loop; excluding the title stops the re-check
+                                // cost on every sync.
+                                emptySeries.Add(string.Format(
+                                    CultureInfo.InvariantCulture, "'{0}' (id={1})", series.Name, series.SeriesId));
                             }
 
+                            reportedSeriesIds[series.SeriesId] = 0;
                             Interlocked.Increment(ref _seriesProgress.Completed);
                             ReportTaskProgress(_seriesProgress, taskProgress);
                             return;
@@ -3510,6 +3498,7 @@ namespace Emby.Xtream.Plugin.Service
 
                         string previousHash;
                         if (config.SmartSkipExisting
+                            && !isForcedSeries
                             && storedHashes.TryGetValue(epHashKey, out previousHash)
                             && previousHash == currentEpHash
                             && Directory.Exists(seriesDir))
@@ -3625,7 +3614,13 @@ namespace Emby.Xtream.Plugin.Service
                     }
                     catch (Exception ex)
                     {
+                        reportedSeriesIds[series.SeriesId] = 0;
                         _logger.Error("Failed to write STRM for series '{0}' (id={1}): [{2}] {3}", series.Name, series.SeriesId, ex.GetType().Name, ex.Message);
+                        if (seriesSubFolderForFailure != null)
+                        {
+                            // As for a failed detail fetch: existing episodes still count as in use.
+                            RecordStrms(FindExistingSeriesStrms(config, seriesSubFolderForFailure, seriesNameForFailure), writtenPaths);
+                        }
                         lock (_failedItemsLock)
                         {
                             _failedItems.Add(new FailedSyncItem
@@ -3697,32 +3692,50 @@ namespace Emby.Xtream.Plugin.Service
                 // cleanup and independent of it — see RemoveExcludedContent remarks.
                 // Note both passes accumulate into Deleted, which therefore counts folders
                 // (exclusions) and files (orphans) together. The dashboard shows one number.
+                // Postponed when a category failed to load, as for movies above. A series whose
+                // episode list came back empty already keeps its existing files in writtenPaths.
                 if (excludedSeriesItems.Count > 0)
                 {
-                    _seriesProgress.Phase = "Removing excluded series";
-                    _seriesProgress.Deleted += RemoveExcludedContent(
-                        config, excludedSeriesItems, config.SeriesFolderMode, categoryNames, folderMappings, "Shows",
-                        writtenPaths);
+                    if (!seriesFetch.HadFailures)
+                    {
+                        _seriesProgress.Phase = "Removing excluded series";
+                        _seriesProgress.Deleted += RemoveExcludedContent(
+                            config, excludedSeriesItems, config.SeriesFolderMode, categoryNames, folderMappings, "Shows", writtenPaths);
+                    }
+                    else
+                    {
+                        _logger.Warn(
+                            "Removing excluded series postponed to the next sync: a category failed to load");
+                    }
                 }
 
                 // Remove the files of shows deliberately un-reviewed this run (ADR-F008) — the
-                // series twin of the movie pass above, same safety contract.
+                // series twin of the movie pass above, same safety contract. Postponed on a
+                // partial fetch for the same reason the exclusion pass above is.
                 if (unreviewedSeriesItems.Count > 0)
                 {
-                    _seriesProgress.Phase = "Removing un-reviewed series";
-                    _seriesProgress.Deleted += RemoveExcludedContent(
-                        config, unreviewedSeriesItems, config.SeriesFolderMode, categoryNames, folderMappings, "Shows",
-                        writtenPaths);
-                    var removedSample = unreviewedSeriesItems
-                        .Select(s => s.Item1)
-                        .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
-                        .Take(HeldSampleSize)
-                        .ToList();
-                    _logger.Info(
-                        "Review gate: removed the files of {0} show(s) you had marked un-reviewed — they are back in the review queue: {1}{2}",
-                        unreviewedSeriesItems.Count,
-                        string.Join(", ", removedSample),
-                        unreviewedSeriesItems.Count > removedSample.Count ? ", ..." : string.Empty);
+                    if (!seriesFetch.HadFailures)
+                    {
+                        _seriesProgress.Phase = "Removing un-reviewed series";
+                        _seriesProgress.Deleted += RemoveExcludedContent(
+                            config, unreviewedSeriesItems, config.SeriesFolderMode, categoryNames, folderMappings, "Shows",
+                            writtenPaths);
+                        var removedSample = unreviewedSeriesItems
+                            .Select(s => s.Item1)
+                            .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
+                            .Take(HeldSampleSize)
+                            .ToList();
+                        _logger.Info(
+                            "Review gate: removed the files of {0} show(s) you had marked un-reviewed — they are back in the review queue: {1}{2}",
+                            unreviewedSeriesItems.Count,
+                            string.Join(", ", removedSample),
+                            unreviewedSeriesItems.Count > removedSample.Count ? ", ..." : string.Empty);
+                    }
+                    else
+                    {
+                        _logger.Warn(
+                            "Removing un-reviewed series postponed to the next sync: a category failed to load");
+                    }
                 }
 
                 // Cleanup orphans. Skipped when any category failed to answer — see the
@@ -3750,17 +3763,28 @@ namespace Emby.Xtream.Plugin.Service
                 if (hashSkippedCount > 0)
                     _logger.Info("Episode hash skip: {0} series unchanged (episode IDs identical to previous sync)", hashSkippedCount);
 
+                if (!emptySeries.IsEmpty)
+                {
+                    var names = emptySeries.OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList();
+                    _logger.Warn(
+                        "{0} series returned no episodes and have no files on disk, so there was nothing to write: {1}{2}. They are checked again every sync; exclude them to stop that.",
+                        names.Count, string.Join(", ", names.Take(20)), names.Count > 20 ? ", ..." : string.Empty);
+                }
+
                 // Every series should leave an episode hash behind: computed after a fetch,
                 // or carried forward by the pre-fetch skip. One that leaves neither ended the
                 // run with no record of what episodes it should hold — it was skipped without
                 // a stored hash to carry, or it returned early (an empty payload with nothing
                 // on disk). Either way the run still reports success, and the gap is otherwise
                 // only findable by diffing the hash map against the catalogue by hand.
+                // Held series are expected to leave no hash — they were deliberately not
+                // fetched — so they are exempt (ADR-F002).
                 var noHashSeries = new List<string>();
                 foreach (var s in allSeries)
                 {
                     if (!updatedHashes.ContainsKey(s.SeriesId.ToString(CultureInfo.InvariantCulture))
-                        && !heldIds.Contains(s.SeriesId))
+                        && !heldIds.Contains(s.SeriesId)
+                        && !reportedSeriesIds.ContainsKey(s.SeriesId))
                     {
                         noHashSeries.Add(string.Format(
                             CultureInfo.InvariantCulture, "'{0}' (id={1})", s.Name, s.SeriesId));
@@ -3773,7 +3797,7 @@ namespace Emby.Xtream.Plugin.Service
                         "{0} series finished with no episode hash recorded, so their episodes were not verified this run: {1}{2}",
                         noHashSeries.Count,
                         string.Join(", ", noHashSeries.Take(20)),
-                        noHashSeries.Count > 20 ? ", …" : string.Empty);
+                        noHashSeries.Count > 20 ? ", ..." : string.Empty);
                 }
 
                 // Report what actually happened. The old line derived "written" as
@@ -3803,20 +3827,30 @@ namespace Emby.Xtream.Plugin.Service
 
                 // Logged after the write-back above, so the numbers are the post-sync state.
                 LogDecisionStoreSizes(config);
-
-                // Episode counts, not series counts: a series can be "written" while every
-                // episode file already matched, which changes nothing on disk for Emby to find.
-                NotifyEmbyLibraryChanged(config, "Shows", _episodeProgress.Added, _episodeProgress.Deleted);
             }
             catch (Exception ex)
             {
                 _logger.Error("Series sync failed: {0}", ex.Message);
                 _seriesProgress.Phase = "Failed: " + ex.Message;
                 seriesSyncSuccess = false;
+
+                // A run that stopped part-way may have cleared the failed list before reaching
+                // these series. Put back any that are not in it, so they are retried next time.
+                lock (_failedItemsLock)
+                {
+                    var listed = new HashSet<int>(_failedItems.Where(i => i.ItemType == "Series").Select(i => i.StreamId));
+                    _failedItems.AddRange(previouslyFailedSeries.Where(i => !listed.Contains(i.StreamId)));
+                }
+
                 throw;
             }
             finally
             {
+                // In the finally, as for movies. Episodes added, not series written: a series
+                // counts as written even when every episode file already matched. Deletions come
+                // from the series counter, which also includes excluded series removed this run.
+                NotifyEmbyLibraryChanged(config, "Shows", _episodeProgress.Added, _seriesProgress.Deleted);
+
                 _seriesProgress.IsRunning = false;
                 if (string.IsNullOrEmpty(_seriesProgress.AbortReason))
                 {
@@ -3867,7 +3901,18 @@ namespace Emby.Xtream.Plugin.Service
         /// Re-attempts the items that failed in the last sync.
         /// </summary>
         /// <returns>False when a movie sync or another retry was already running.</returns>
-        public async Task<bool> RetryFailedAsync(CancellationToken cancellationToken)
+        public Task<bool> RetryFailedAsync(CancellationToken cancellationToken)
+            => RetryFailedAsync(null, null, cancellationToken);
+
+        /// <summary>
+        /// Retries failed items. Movies are rewritten one by one; series go through a normal
+        /// series sync, which re-processes every series in the failed list (see
+        /// SyncSeriesCoreAsync), so a retried series is written exactly as the sync writes it.
+        /// </summary>
+        /// <param name="configOverride">Configuration to use; the plugin's own when null. For tests.</param>
+        /// <param name="saveConfig">Persists the configuration; the plugin's own save when null.</param>
+        internal async Task<bool> RetryFailedAsync(
+            PluginConfiguration configOverride, Action saveConfig, CancellationToken cancellationToken)
         {
             List<FailedSyncItem> items;
             lock (_failedItemsLock) { items = _failedItems.ToList(); }
@@ -3903,8 +3948,15 @@ namespace Emby.Xtream.Plugin.Service
                     }
                 }
 
-                var config = Plugin.Instance.Configuration;
-                _movieProgress = new SyncProgress { IsRunning = true, Phase = "Retrying failed items", Total = items.Count };
+                var config = configOverride ?? Plugin.Instance.Configuration;
+                if (saveConfig == null)
+                {
+                    saveConfig = () => Plugin.Instance.SaveConfiguration();
+                }
+
+                var movieItems = items.Where(i => i.ItemType == "Movie").ToList();
+                var hasSeriesItems = items.Any(i => i.ItemType == "Series");
+                _movieProgress = new SyncProgress { IsRunning = true, Phase = "Retrying failed items", Total = movieItems.Count };
                 retryStarted = true;
 
                 var semaphore = new SemaphoreSlim(ResolveSyncParallelism(config));
@@ -3914,15 +3966,12 @@ namespace Emby.Xtream.Plugin.Service
                 var succeeded = new List<FailedSyncItem>();
                 var succeededLock = new object();
 
-                var tasks = items.Select(async item =>
+                var tasks = movieItems.Select(async item =>
                 {
                     await semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
                     try
                     {
-                        if (item.ItemType == "Movie")
-                            await RetryMovieItemAsync(item, config, categoryNames, folderMappings, writtenPaths, cancellationToken).ConfigureAwait(false);
-                        else if (item.ItemType == "Series")
-                            await RetrySeriesItemAsync(item, config, cancellationToken).ConfigureAwait(false);
+                        await RetryMovieItemAsync(item, config, categoryNames, folderMappings, writtenPaths, cancellationToken).ConfigureAwait(false);
 
                         lock (succeededLock) { succeeded.Add(item); }
                         Interlocked.Increment(ref _movieProgress.Completed);
@@ -3945,6 +3994,19 @@ namespace Emby.Xtream.Plugin.Service
                 {
                     foreach (var s in succeeded)
                         _failedItems.Remove(s);
+                }
+
+                // Retried series are reported by the series sync below; movies are written here.
+                NotifyEmbyLibraryChanged(config, "Movies", _movieProgress.Added, 0);
+
+                // After the movie bookkeeping above, so a series sync that throws cannot leave
+                // successfully retried movies marked as failed. The series gate is held, so call
+                // the core rather than SyncSeriesAsync. It removes the series it processes from
+                // the failed list and adds back any that fail again.
+                if (hasSeriesItems)
+                {
+                    _movieProgress.Phase = "Retrying failed series";
+                    await SyncSeriesCoreAsync(config, cancellationToken, saveConfig, null).ConfigureAwait(false);
                 }
 
                 return true;
@@ -4072,59 +4134,6 @@ namespace Emby.Xtream.Plugin.Service
             }
 
             await Task.CompletedTask.ConfigureAwait(false);
-        }
-
-        private async Task RetrySeriesItemAsync(
-            FailedSyncItem item,
-            PluginConfiguration config,
-            CancellationToken cancellationToken)
-        {
-            var detail = await FetchSeriesDetailAsync(item.StreamId, config, cancellationToken).ConfigureAwait(false);
-            if (detail == null || detail.Episodes == null || detail.Episodes.Count == 0) return;
-
-            var cleanedName = config.EnableContentNameCleaning
-                ? ContentNameCleaner.CleanContentName(item.Name, config.ContentRemoveTerms)
-                : item.Name;
-
-            var seriesDir = Path.Combine(config.StrmLibraryPath, "Shows", SanitizeFileName(cleanedName));
-            Directory.CreateDirectory(seriesDir);
-
-            foreach (var kvp in detail.Episodes)
-            {
-                var seasonNum = kvp.Key;
-                var episodes = kvp.Value;
-                if (episodes == null) continue;
-
-                var seasonDir = Path.Combine(seriesDir, string.Format(CultureInfo.InvariantCulture, "Season {0:D2}", seasonNum));
-                Directory.CreateDirectory(seasonDir);
-
-                foreach (var ep in episodes)
-                {
-                    if (ep == null) continue;
-                    var epFile = string.Format(CultureInfo.InvariantCulture,
-                        "S{0:D2}E{1:D2}.strm", seasonNum, ep.EpisodeNum);
-                    var epPath = Path.Combine(seasonDir, epFile);
-
-                    var ext = !string.IsNullOrEmpty(ep.ContainerExtension) ? ep.ContainerExtension : "mp4";
-                    var epUrl = string.Format(CultureInfo.InvariantCulture,
-                        "{0}/series/{1}/{2}/{3}.{4}",
-                        config.BaseUrl, Uri.EscapeDataString(config.Username ?? string.Empty), Uri.EscapeDataString(config.Password ?? string.Empty), ep.Id, ext);
-
-                    var fileExists = File.Exists(epPath);
-
-                    // Skip write if file content is already up to date (avoids Emby library re-scan)
-                    if (!fileExists || File.ReadAllText(epPath) != epUrl)
-                    {
-                        Directory.CreateDirectory(seasonDir);
-                        File.WriteAllText(epPath, epUrl);
-
-                        if (!fileExists)
-                        {
-                            Interlocked.Increment(ref _episodeProgress.Added);
-                        }
-                    }
-                }
-            }
         }
 
         private void AddHistoryEntry(SyncHistoryEntry entry)
@@ -4681,41 +4690,6 @@ namespace Emby.Xtream.Plugin.Service
             return result;
         }
 
-        /// <summary>
-        /// Finds the STRM files already on disk for <paramref name="seriesName"/>, if any.
-        /// </summary>
-        /// <remarks>
-        /// Used only on the empty-detail path, so the per-series readdir stays off the hot loop.
-        /// Folder names carry an optional metadata-ID suffix, so the comparison strips it the same
-        /// way the pre-fetch smart-skip index does.
-        /// </remarks>
-        private string[] FindExistingSeriesStrms(PluginConfiguration config, string subFolder, string seriesName)
-        {
-            try
-            {
-                var parent = Path.Combine(config.StrmLibraryPath, subFolder);
-                if (!Directory.Exists(parent))
-                {
-                    return Array.Empty<string>();
-                }
-
-                foreach (var dir in Directory.GetDirectories(parent))
-                {
-                    var stripped = StripFolderIdSuffix(Path.GetFileName(dir));
-                    if (string.Equals(stripped, seriesName, StringComparison.OrdinalIgnoreCase))
-                    {
-                        return Directory.GetFiles(dir, "*.strm", SearchOption.AllDirectories);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.Debug("Could not probe existing STRM files for series '{0}': {1}", seriesName, ex.Message);
-            }
-
-            return Array.Empty<string>();
-        }
-
         private async Task<SeriesDetailInfo> FetchSeriesDetailAsync(
             int seriesId, PluginConfiguration config, CancellationToken cancellationToken)
         {
@@ -4724,614 +4698,39 @@ namespace Emby.Xtream.Plugin.Service
                 "{0}/player_api.php?username={1}&password={2}&action=get_series_info&series_id={3}",
                 config.BaseUrl, Uri.EscapeDataString(config.Username ?? string.Empty), Uri.EscapeDataString(config.Password ?? string.Empty), seriesId);
 
-            // Some providers answer get_series_info with HTTP 200 but an empty episode
-            // list when several detail requests arrive at once (SyncParallelism > 1). The
-            // payload is fine on a lightly-loaded retry, so re-fetch a few times with a
-            // short backoff before giving up. Without this, each empty response is silently
-            // treated as "no episodes" and the series is skipped, so a batch of newly-added
-            // (or just re-included) titles only trickles in a couple per sync. The backoff
-            // also spaces concurrent detail calls apart, easing the contention that produces
-            // the empties. A throw still propagates to the caller's catch unchanged.
-            var maxAttempts = Math.Max(1, SeriesDetailMaxAttempts);
-            SeriesDetailInfo detail = null;
-            for (int attempt = 1; attempt <= maxAttempts; attempt++)
+            var detail = await GetSeriesDetailAsync(url).ConfigureAwait(false);
+            if (HasEpisodes(detail))
             {
-                var json = await _httpClient.GetStringAsync(url).ConfigureAwait(false);
-                detail = STJ.JsonSerializer.Deserialize<SeriesDetailInfo>(json, JsonOptions);
-
-                if (detail != null && detail.Episodes != null && detail.Episodes.Count > 0)
-                    return detail;
-
-                if (attempt < maxAttempts)
-                {
-                    _logger.Debug("Empty episode list for series {0} (attempt {1}/{2}) — retrying", seriesId, attempt, maxAttempts);
-                    if (SeriesDetailRetryBaseDelayMs > 0)
-                        await Task.Delay(SeriesDetailRetryBaseDelayMs * attempt, cancellationToken).ConfigureAwait(false);
-                }
+                return detail;
             }
 
-            // Still empty after retries — return it and let the caller record the outcome.
-            return detail;
+            // Some providers answer 200 with an empty episode list when several detail requests
+            // arrive at once, and the same series comes back fine a moment later. Retry once.
+            // Only once: a series that really has no episodes never gets an episode hash, so it
+            // is fetched on every sync, and each extra attempt is paid on every one of them.
+            // Found in andyj682/emby-xtream-dedupe (ff63da3).
+            _logger.Debug("Series {0} returned no episodes; retrying once", seriesId);
+            if (SeriesDetailRetryDelayMs > 0)
+            {
+                await Task.Delay(SeriesDetailRetryDelayMs, cancellationToken).ConfigureAwait(false);
+            }
+
+            var retried = await GetSeriesDetailAsync(url).ConfigureAwait(false);
+            if (HasEpisodes(retried))
+            {
+                _logger.Info("Series {0} returned episodes on retry after an empty answer", seriesId);
+            }
+
+            return retried;
         }
 
-        /// <summary>
-        /// Deletes the on-disk folders of items the user has explicitly excluded.
-        /// </summary>
-        /// <remarks>
-        /// Runs independently of <see cref="PluginConfiguration.CleanupOrphans"/> and ignores
-        /// <see cref="PluginConfiguration.OrphanSafetyThreshold"/>. That threshold exists to survive
-        /// a provider returning a truncated catalogue; an exclusion is a deliberate user action, so
-        /// suppressing the delete would just look like the filter doing nothing.
-        ///
-        /// Folder matching strips any metadata-ID suffix, so an excluded title is found whether it
-        /// was written as "Some Movie", "Some Movie [tmdbid=123]" or "Some Show [tvdbid=456]".
-        ///
-        /// <para>
-        /// <b>It will not delete a folder this run wrote</b> (ADR-F007). Matching is by name, but
-        /// exclusion is stored per provider ID, and the two disagree whenever distinct IDs produce
-        /// one folder name — two provider rows for the same film, or two different titles that
-        /// sanitize alike. When that happens the write loop creates the included title's folder and
-        /// this pass deletes it moments later, every run, so a title the user included and reviewed
-        /// is permanently absent with nothing in the log to explain it.
-        /// </para>
-        /// <para>
-        /// The guard is deliberately not a name rule. Every name comparison is a guess about
-        /// identity that some input violates, whereas "the sync must not delete what it just
-        /// wrote" holds regardless of why the names collided. It is also surgical: a genuinely
-        /// excluded title with no included twin writes nothing, so it is absent from
-        /// <paramref name="writtenPaths"/> and is removed exactly as before.
-        /// </para>
-        /// </remarks>
-        /// <param name="config">Active plugin configuration (supplies the library root).</param>
-        /// <param name="excludedItems">Cleaned display name + category ID for each excluded item.</param>
-        /// <param name="folderMode">"single", "multiple" or "custom".</param>
-        /// <param name="categoryNames">Category ID → name, used by "multiple" mode.</param>
-        /// <param name="folderMappings">Category ID → folder, used by "custom" mode.</param>
-        /// <param name="rootFolder">"Movies" or "Shows".</param>
-        /// <param name="writtenPaths">
-        /// Every STRM path this run wrote or deliberately kept. Folders containing one are never
-        /// deleted here. Episodes sit a level below the show folder, so ancestors count too.
-        /// </param>
-        /// <returns>The number of folders deleted.</returns>
-        private int RemoveExcludedContent(
-            PluginConfiguration config,
-            List<Tuple<string, int?>> excludedItems,
-            string folderMode,
-            Dictionary<int, string> categoryNames,
-            Dictionary<int, string> folderMappings,
-            string rootFolder,
-            HashSet<string> writtenPaths)
+        private async Task<SeriesDetailInfo> GetSeriesDetailAsync(string url)
         {
-            if (excludedItems == null || excludedItems.Count == 0)
-            {
-                return 0;
-            }
-
-            var removed = 0;
-            var kept = 0;
-
-            // Every folder this run wrote into, plus their ancestors up to the library root —
-            // episode STRMs live under a season folder, so the show folder an exclusion targets
-            // is two levels above the path that protects it. Built once; the walk stops as soon
-            // as it reaches a directory already recorded, since that one's ancestors are too.
-            var protectedDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            if (writtenPaths != null && writtenPaths.Count > 0)
-            {
-                var separators = new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar };
-                var rootLength = (config.StrmLibraryPath ?? string.Empty).TrimEnd(separators).Length;
-
-                foreach (var written in writtenPaths)
-                {
-                    var dir = Path.GetDirectoryName(written);
-                    for (var depth = 0; depth < 8 && !string.IsNullOrEmpty(dir); depth++)
-                    {
-                        var normalized = dir.TrimEnd(separators);
-                        if (normalized.Length <= rootLength || !protectedDirs.Add(normalized))
-                        {
-                            break;
-                        }
-
-                        dir = Path.GetDirectoryName(normalized);
-                    }
-                }
-            }
-
-            // subFolder → { folderNameWithoutIdSuffix → fullPath }. One readdir per subfolder.
-            var dirIndexCache = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
-
-            foreach (var item in excludedItems)
-            {
-                var sanitized = SanitizeFileName(item.Item1);
-                if (string.IsNullOrWhiteSpace(sanitized))
-                {
-                    continue;
-                }
-
-                var subFolder = BuildContentFolderPath(
-                    folderMode, item.Item2, categoryNames, folderMappings, rootFolder);
-                if (subFolder == null)
-                {
-                    continue;
-                }
-
-                Dictionary<string, string> dirIndex;
-                if (!dirIndexCache.TryGetValue(subFolder, out dirIndex))
-                {
-                    dirIndex = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                    var fullPath = Path.Combine(config.StrmLibraryPath, subFolder);
-                    if (Directory.Exists(fullPath))
-                    {
-                        foreach (var dir in Directory.GetDirectories(fullPath))
-                        {
-                            var stripped = StripFolderIdSuffix(Path.GetFileName(dir));
-                            if (!string.IsNullOrEmpty(stripped) && !dirIndex.ContainsKey(stripped))
-                            {
-                                dirIndex[stripped] = dir;
-                            }
-                        }
-                    }
-
-                    dirIndexCache[subFolder] = dirIndex;
-                }
-
-                string existingDir;
-                if (!dirIndex.TryGetValue(sanitized, out existingDir))
-                {
-                    continue;
-                }
-
-                // An included title wrote this folder moments ago (ADR-F007). Two provider IDs
-                // produced one folder name; deleting it would erase content the user kept, and
-                // the next run would write and delete it again. Logged at Info because the state
-                // is genuinely wrong upstream and the user is the only one who can resolve it.
-                if (protectedDirs.Contains(existingDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)))
-                {
-                    kept++;
-                    _logger.Info(
-                        "Kept '{0}': excluded item '{1}' matches a folder this sync just wrote for an "
-                        + "included title. Two provider entries share a folder name, so excluding one "
-                        + "would delete the other. Nothing was removed — exclude both entries, or merge "
-                        + "them at the provider, if you meant to drop this title.",
-                        existingDir, sanitized);
-                    continue;
-                }
-
-                try
-                {
-                    // Delete only the files this plugin actually wrote, verified by content, then
-                    // prune whatever that emptied. Matching is by title alone, so a match is not
-                    // proof of ownership: without this a user's own "Ben-Hur" folder would be
-                    // destroyed by excluding the provider's "Ben-Hur", and a hand-written .nfo or a
-                    // trailer.strm sitting beside our output would go with it. See ADR-014.
-                    var deletedFiles = StrmOwnership.DeleteOwnedFiles(
-                        existingDir, config.BaseUrl, config.DispatcharrUrl, out var folderGone);
-
-                    if (deletedFiles == 0)
-                    {
-                        _logger.Debug(
-                            "Skipping '{0}' for excluded item '{1}': nothing in it was written by this plugin",
-                            existingDir, sanitized);
-                        continue;
-                    }
-
-                    dirIndex.Remove(sanitized);
-                    removed++;
-                    _logger.Info(
-                        folderGone
-                            ? "Removed excluded item folder: {0}"
-                            : "Removed plugin files for excluded item, folder kept (still has other content): {0}",
-                        existingDir);
-                }
-                catch (Exception ex)
-                {
-                    _logger.Warn("Failed to remove excluded item folder '{0}': {1}", existingDir, ex.Message);
-                }
-            }
-
-            if (removed > 0)
-            {
-                _logger.Info("Removed {0} folder(s) for explicitly excluded items under {1}", removed, rootFolder);
-            }
-
-            if (kept > 0)
-            {
-                _logger.Info(
-                    "Kept {0} folder(s) under {1} that an excluded item matched by name but an included "
-                    + "title had just written. Each is a pair of provider entries sharing one folder name.",
-                    kept, rootFolder);
-            }
-
-            return removed;
+            var json = await _httpClient.GetStringAsync(url).ConfigureAwait(false);
+            return STJ.JsonSerializer.Deserialize<SeriesDetailInfo>(json, JsonOptions);
         }
 
-
-        private int CleanupOrphans(
-            string rootPath, HashSet<string> validPaths, double safetyThreshold, PluginConfiguration config)
-        {
-            if (!Directory.Exists(rootPath))
-            {
-                return 0;
-            }
-
-            var existingStrms = Directory.GetFiles(rootPath, "*.strm", SearchOption.AllDirectories);
-
-            // Nothing was written or preserved this run, but files exist on disk. That is a
-            // provider returning an empty catalogue, not the user deleting their whole library.
-            // The ratio guard below cannot catch this at small N (it only applies above 10 files),
-            // so refuse outright rather than emptying the library. See ADR-013.
-            if (validPaths.Count == 0 && existingStrms.Length > 0)
-            {
-                _logger.Warn(
-                    "Orphan cleanup skipped: the catalogue produced no files this run but {0} STRM file(s) exist under {1} — refusing to treat an empty catalogue as a deletion",
-                    existingStrms.Length, rootPath);
-                return 0;
-            }
-
-            // Being a .strm under our library root is not proof we wrote it. Verify ownership
-            // before considering anything for deletion — a user's own STRM that the provider
-            // never listed would otherwise look exactly like an orphan. Only orphan candidates
-            // are read, so the cost stays proportional to deletions, not to library size.
-            // Ordered so the logged sample below is the same 15 paths on every run rather than
-            // whichever 15 the filesystem happened to enumerate first. Deletion order is
-            // otherwise irrelevant — the files are independent.
-            var orphans = existingStrms
-                .Where(s => !validPaths.Contains(s))
-                .Where(s => StrmOwnership.IsOwnedStrm(s, config.BaseUrl, config.DispatcharrUrl))
-                .OrderBy(s => s, StringComparer.OrdinalIgnoreCase)
-                .ToList();
-
-            var foreignCount = existingStrms.Length - validPaths.Count - orphans.Count;
-            if (foreignCount > 0)
-            {
-                _logger.Info(
-                    "Orphan cleanup: leaving {0} STRM file(s) under {1} that this plugin did not write",
-                    foreignCount, rootPath);
-            }
-
-            // Ratio is taken over the files we could actually have written (what we wrote or kept,
-            // plus the orphans we own). Counting foreign files in the denominator would dilute the
-            // ratio and make the guard fire less often than intended.
-            var ownedTotal = validPaths.Count + orphans.Count;
-            if (safetyThreshold > 0 && ownedTotal > 10 && orphans.Count > 0)
-            {
-                double ratio = (double)orphans.Count / ownedTotal;
-                if (ratio > safetyThreshold)
-                {
-                    _logger.Warn(
-                        "Orphan cleanup skipped: {0}/{1} ({2:P0}) exceeds safety threshold {3:P0} — possible provider issue",
-                        orphans.Count, ownedTotal, ratio, safetyThreshold);
-                    return 0;
-                }
-            }
-
-            var removed = 0;
-
-            // A successful deletion was previously logged nowhere, at any level — only the count
-            // was. So "the sync removed 360 episodes" was unanswerable after the fact: the files
-            // were gone and nothing recorded which ones. Worse, the class of damage this hides is
-            // exactly the dangerous one — a title whose provider id churned leaves a .strm that is
-            // not in writtenPaths, so it is deleted as an orphan even though the user still wants
-            // it (see ADR-F004). Keep a sample so the question is answerable next time.
-            const int DeletedSampleSize = 15;
-            // Every deletion, not just the sample. Bounded by the orphan count, which the ratio
-            // guard above already caps, so this cannot grow to the size of the library.
-            var deleted = new List<string>();
-
-            foreach (var strmFile in orphans)
-            {
-                try
-                {
-                    // delete-ok: `orphans` is already filtered through StrmOwnership.IsOwnedStrm
-                    // above, so every path here is one this plugin wrote.
-                    File.Delete(strmFile);
-                    removed++;
-                    deleted.Add(RelativeToRoot(strmFile, rootPath));
-
-                    // Remove empty parent directories
-                    var dir = Path.GetDirectoryName(strmFile);
-                    while (!string.IsNullOrEmpty(dir) &&
-                           !string.Equals(dir, rootPath, StringComparison.OrdinalIgnoreCase) &&
-                           Directory.Exists(dir) &&
-                           Directory.GetFileSystemEntries(dir).Length == 0)
-                    {
-                        // delete-ok: prunes a directory the loop condition just proved empty.
-                        Directory.Delete(dir);
-                        dir = Path.GetDirectoryName(dir);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.Debug("Failed to cleanup orphan '{0}': {1}", strmFile, ex.Message);
-                }
-            }
-
-            if (removed > 0)
-            {
-                // Already in order: `orphans` was sorted before the loop, so the sample is the
-                // same 15 paths on every run.
-                var sample = deleted.Count > DeletedSampleSize
-                    ? deleted.GetRange(0, DeletedSampleSize)
-                    : deleted;
-
-                // Past the sample the log alone stops being able to answer "what went?" — and
-                // that is exactly the size of event where the question gets asked. Two real
-                // cases motivated this: 360 files under Shows and 126 under Movies, neither
-                // explainable afterwards. The record is written whatever the log level, because
-                // the question is always asked in hindsight and a diagnostic you had to enable
-                // beforehand cannot answer it.
-                var recordPath = deleted.Count > sample.Count
-                    ? WriteDeletionRecord(rootPath, deleted)
-                    : null;
-
-                _logger.Info(
-                    "Removed {0} orphaned STRM files from {1}: {2}{3}",
-                    removed, rootPath,
-                    string.Join(", ", sample),
-                    deleted.Count > sample.Count
-                        ? ", ... (full list: " + (recordPath ?? "could not be written") + ")"
-                        : string.Empty);
-            }
-
-            return removed;
-        }
-
-        /// <summary>
-        /// Takes a rollback copy of the configuration file if it has changed since the last one
-        /// (ADR-F005 mechanism 3). Returns the path written, or null if nothing was.
-        /// <para>
-        /// Called at the START of a sync, before the run performs any writes of its own — the
-        /// naming-version upgrade and the review gate's write-back both save the configuration,
-        /// so a copy taken later would already be of the post-write state.
-        /// </para>
-        /// <para>
-        /// This is a rollback, not a backup. It sits on the same volume as the file it protects
-        /// and does nothing for a lost disk; what it covers is a bad write through the plugin's
-        /// own save path, where the last good state is otherwise gone. Never throws — failing to
-        /// take a safety copy must not stop a sync the user asked for.
-        /// </para>
-        /// </summary>
-        internal string SnapshotConfigurationForRollback(PluginConfiguration config)
-        {
-            var keep = config.ConfigRollbackCount;
-            if (keep <= 0)
-            {
-                return null;
-            }
-
-            try
-            {
-                var source = ConfigRollbackSourcePath;
-                if (string.IsNullOrEmpty(source))
-                {
-                    // Plugin.Instance throws before ApplicationPaths is initialised, so this is
-                    // guarded rather than resolved at construction.
-                    source = Plugin.InstanceOrNull?.ConfigPath;
-                }
-
-                if (string.IsNullOrEmpty(source) || !File.Exists(source))
-                {
-                    return null;
-                }
-
-                var directory = Path.Combine(Path.GetDirectoryName(source) ?? string.Empty, RollbackFolderName);
-                Directory.CreateDirectory(directory);
-
-                // Skip when nothing changed, or a user who syncs hourly and edits nothing would
-                // churn several megabytes a day and push the real last-good state out of the
-                // retention window — which would defeat the whole mechanism.
-                var currentHash = HashFile(source);
-                var existing = Directory.GetFiles(directory, "*.xml");
-                Array.Sort(existing, StringComparer.OrdinalIgnoreCase);
-                if (existing.Length > 0 && currentHash != null
-                    && string.Equals(currentHash, HashFile(existing[existing.Length - 1]), StringComparison.Ordinal))
-                {
-                    return null;
-                }
-
-                // Never overwrite, and never rely on the clock for uniqueness. The movie sync
-                // saves the configuration and the series sync runs straight afterwards, so two
-                // copies arriving in the same instant is ordinary — and back-to-back syncs have
-                // been observed completing inside a single millisecond, so even millisecond
-                // stamps collide. A collision used to mean one copy silently replacing the
-                // other, destroying exactly the state being preserved; now it just takes the
-                // next free name.
-                //
-                // The collision counter is separated by '_' and zero-padded, both deliberately.
-                // The prune sorts by name and relies on that being chronological: '_' (0x5F)
-                // sorts AFTER '.' (0x2E), so "…123_001.xml" follows "…123.xml" rather than
-                // preceding it, which a '-' separator would have got backwards. Padding keeps
-                // 002 after 001 rather than after 010.
-                var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss-fff", CultureInfo.InvariantCulture);
-                var target = Path.Combine(directory, stamp + ".xml");
-                for (var attempt = 1; File.Exists(target) && attempt < 1000; attempt++)
-                {
-                    target = Path.Combine(
-                        directory,
-                        string.Format(CultureInfo.InvariantCulture, "{0}_{1:D3}.xml", stamp, attempt));
-                }
-
-                File.Copy(source, target, false);
-
-                PruneConfigurationCopies(directory, keep);
-                _logger.Debug("Configuration rollback copy written to {0}", target);
-                return target;
-            }
-            catch (Exception ex)
-            {
-                _logger.Warn("Could not take a configuration rollback copy: {0}", ex.Message);
-                return null;
-            }
-        }
-
-        /// <summary>SHA-256 of a file, or null if it cannot be read.</summary>
-        private static string HashFile(string path)
-        {
-            try
-            {
-                using (var sha = System.Security.Cryptography.SHA256.Create())
-                using (var stream = File.OpenRead(path))
-                {
-                    return BitConverter.ToString(sha.ComputeHash(stream));
-                }
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        /// <summary>
-        /// Keeps the rollback copies bounded. Name-sorted, which is chronological because the
-        /// filename is the timestamp.
-        /// </summary>
-        private void PruneConfigurationCopies(string directory, int keep)
-        {
-            var existing = Directory.GetFiles(directory, "*.xml");
-            if (existing.Length <= keep)
-            {
-                return;
-            }
-
-            Array.Sort(existing, StringComparer.OrdinalIgnoreCase);
-
-            for (var i = 0; i < existing.Length - keep; i++)
-            {
-                try
-                {
-                    // delete-ok: removes this plugin's own rollback copies from the
-                    // "xtream-rollback" folder it created beside its configuration file. These are copies of the
-                    // plugin's XML settings, never library content, so the StrmOwnership check
-                    // does not apply and nothing here can reach a .strm or a media folder.
-                    File.Delete(existing[i]);
-                }
-                catch (Exception ex)
-                {
-                    _logger.Debug("Could not prune old rollback copy '{0}': {1}", existing[i], ex.Message);
-                }
-            }
-        }
-
-        /// <summary>
-        /// Writes the complete list of paths a cleanup removed, and returns where it went
-        /// (null if it could not be written). Called only when the deletion count exceeds the
-        /// sample the log line carries.
-        /// <para>
-        /// Never throws: the files are already gone by the time this runs, so failing to record
-        /// what happened must not also fail the sync.
-        /// </para>
-        /// </summary>
-        private string WriteDeletionRecord(string rootPath, List<string> deletedPaths)
-        {
-            var directory = DeletionRecordDirectory;
-            if (string.IsNullOrEmpty(directory))
-            {
-                try
-                {
-                    // Plugin.Instance throws when ApplicationPaths is not initialised yet, which
-                    // is why this is guarded rather than read at construction.
-                    directory = Plugin.Instance?.ApplicationPaths?.LogDirectoryPath;
-                }
-                catch (Exception ex)
-                {
-                    _logger.Debug("No log directory available for the deleted-path record: {0}", ex.Message);
-                    return null;
-                }
-            }
-
-            if (string.IsNullOrEmpty(directory))
-            {
-                return null;
-            }
-
-            try
-            {
-                Directory.CreateDirectory(directory);
-
-                // Timestamp FIRST so an ordinary name sort is a chronological sort — the prune
-                // below depends on that, and putting the root name first would group Movies and
-                // Shows into separate runs and prune the wrong files.
-                var leaf = Path.GetFileName(rootPath.TrimEnd(
-                    Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
-                var fileName = string.Format(
-                    CultureInfo.InvariantCulture,
-                    "xtream-deleted-{0:yyyyMMdd-HHmmss}-{1}.txt",
-                    DateTime.Now,
-                    string.IsNullOrEmpty(leaf) ? "library" : SanitizeFileName(leaf));
-                var path = Path.Combine(directory, fileName);
-
-                using (var writer = new StreamWriter(path, false))
-                {
-                    writer.WriteLine(string.Format(
-                        CultureInfo.InvariantCulture,
-                        "# {0} file(s) removed from {1} at {2:yyyy-MM-dd HH:mm:ss}",
-                        deletedPaths.Count, rootPath, DateTime.Now));
-                    writer.WriteLine("# Paths are relative to the root above.");
-                    foreach (var deletedPath in deletedPaths)
-                    {
-                        writer.WriteLine(deletedPath);
-                    }
-                }
-
-                PruneDeletionRecords(directory);
-                return path;
-            }
-            catch (Exception ex)
-            {
-                _logger.Warn("Could not write the deleted-path record: {0}", ex.Message);
-                return null;
-            }
-        }
-
-        /// <summary>
-        /// Keeps the deleted-path records bounded. Name-sorted, which is chronological because
-        /// the timestamp leads the filename.
-        /// </summary>
-        private void PruneDeletionRecords(string directory)
-        {
-            const int KeepRecords = 10;
-
-            var existing = Directory.GetFiles(directory, "xtream-deleted-*.txt");
-            if (existing.Length <= KeepRecords)
-            {
-                return;
-            }
-
-            Array.Sort(existing, StringComparer.OrdinalIgnoreCase);
-
-            for (var i = 0; i < existing.Length - KeepRecords; i++)
-            {
-                try
-                {
-                    // delete-ok: removes this plugin's own diagnostic records from Emby's log
-                    // directory, matched on the "xtream-deleted-*.txt" name pattern it writes
-                    // itself. These are text files about the library, never library content, so
-                    // the StrmOwnership check does not apply and nothing here can reach a .strm.
-                    File.Delete(existing[i]);
-                }
-                catch (Exception ex)
-                {
-                    _logger.Debug("Could not prune old deleted-path record '{0}': {1}",
-                        existing[i], ex.Message);
-                }
-            }
-        }
-
-        /// <summary>
-        /// Trims the library root off a path so the deleted-file sample reads as
-        /// <c>Show Name [tmdbid=1]/Season 01/....strm</c> rather than repeating the root on
-        /// every entry. Falls back to the full path if it does not sit under the root.
-        /// </summary>
-        private static string RelativeToRoot(string fullPath, string rootPath)
-        {
-            if (!string.IsNullOrEmpty(rootPath)
-                && fullPath.StartsWith(rootPath, StringComparison.OrdinalIgnoreCase))
-            {
-                return fullPath
-                    .Substring(rootPath.Length)
-                    .TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-            }
-
-            return fullPath;
-        }
+        private static bool HasEpisodes(SeriesDetailInfo detail)
+            => detail != null && detail.Episodes != null && detail.Episodes.Count > 0;
     }
 }
