@@ -35,6 +35,7 @@ exists, and a bare `ADR-016` anywhere in the tree is unambiguously upstream's.
 | [ADR-F005](005-self-protecting-configuration.md) | Make the plugin protect its own configuration | Accepted |
 | [ADR-F006](006-fetch-movie-detail-on-sync.md) | Fetch movie detail for titles we sync | Proposed |
 | [ADR-F007](007-never-delete-what-the-sync-just-wrote.md) | Never delete a folder the sync just wrote | Accepted |
+| [ADR-F008](008-unreview-tombstones.md) | Un-reviewing must persist, and take the files with it | Accepted |
 
 ## History
 

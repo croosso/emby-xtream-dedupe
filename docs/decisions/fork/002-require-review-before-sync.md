@@ -67,6 +67,10 @@ A title **already on disk** is exempt: it syncs, and its StreamId is added to th
 set. Without this, a provider reassigning an established film's ID would make it look
 un-reviewed and quietly withhold a film the user already keeps.
 
+*(Amended by [ADR-F008](008-unreview-tombstones.md): the exemption could not tell ID churn
+from a deliberate un-review, so un-reviewing a title on disk never persisted — the
+exemption re-reviewed it on the next sync. The tombstone stores in ADR-F008 now gate it.)*
+
 Identity comes from the library itself. `BuildLibraryIdentityIndex` walks the STRM tree once
 per run and collects two markers from folder names: the TMDB ID in a `[tmdbid=N]` suffix,
 and the ID-stripped folder name. This is a record of past *keep* decisions that outlives the
