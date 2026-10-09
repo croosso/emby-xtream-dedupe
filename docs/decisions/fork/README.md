@@ -33,9 +33,10 @@ exists, and a bare `ADR-016` anywhere in the tree is unambiguously upstream's.
 | [ADR-F003](003-retire-dispatcharr-episode-refresh.md) | Retire the sync-time Dispatcharr episode refresh | Accepted |
 | [ADR-F004](004-survive-provider-id-churn.md) | Survive provider ID churn inside the plugin | Accepted (stages 1 and 3 implemented; stage 2 withdrawn) |
 | [ADR-F005](005-self-protecting-configuration.md) | Make the plugin protect its own configuration | Accepted |
-| [ADR-F006](006-fetch-movie-detail-on-sync.md) | Fetch movie detail for titles we sync | Proposed |
+| [ADR-F006](006-fetch-movie-detail-on-sync.md) | Fetch movie detail for titles we sync | **Withdrawn** (built and measured; no consumer) |
 | [ADR-F007](007-never-delete-what-the-sync-just-wrote.md) | Never delete a folder the sync just wrote | Accepted |
 | [ADR-F008](008-unreview-tombstones.md) | Un-reviewing must persist, and take the files with it | Accepted |
+| [ADR-F009](009-publish-the-wanted-set.md) | Publish the wanted set as a file | Accepted |
 
 ## History
 
@@ -43,3 +44,9 @@ These three were renumbered on 2026-09-07, during the merge that brought in upst
 `4b81027..3482982`. They were previously ADR-016, ADR-017 and ADR-018. References
 written before that date — in the CHANGELOG for releases 1.4.0 through 1.5.0, in commit
 messages, and in git history generally — use the old numbers.
+
+`009-publish-the-wanted-set.md` was renumbered from F008 during the 2026-10 merge of
+`andyj682/main`. Both forks had independently allocated F008 — this tree shipped
+`008-unreview-tombstones.md` on main first, so the incoming publish-the-wanted-set ADR
+(older by authoring date, newer by arrival here) took the next number. References in
+the incoming commits' messages still say F008 for it.

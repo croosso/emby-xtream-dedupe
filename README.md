@@ -214,19 +214,21 @@ A configuration UI embedded in Emby's plugin settings with five tabs.
 
 ### Step 1: Download the Plugin
 
-Download `Emby.Xtream.Plugin.dll` from the [latest release](../../releases/latest). The same
-file loads on Emby Server 4.9 and 4.10 (upstream ADR-017: the 4.9-SDK build resolves
-AddConsumer/RemoveConsumer on 4.10 by name and signature).
+Download `Emby.Xtream.Plugin.dll` from the [latest release](../../releases/latest). From this
+fork's 1.9.0 the same file works on Emby Server 4.9 and 4.10.
 
 > Only the single DLL file is needed — no other dependencies.
 
-> Releases also carry `Emby.Xtream.Plugin-4.10.dll`. It is the same file under the name older
-> 4.10 installs expect, so either one is fine.
+> Releases also carry `Emby.Xtream.Plugin-4.10.dll`. It is the same file under the name this
+> plugin's update check uses on Emby 4.10, so installs that update themselves keep doing so.
+> **Don't download it for a new install:** Emby names each plugin's settings file after the DLL,
+> so under that name the plugin starts with blank settings. Installed by hand, the file must be
+> named `Emby.Xtream.Plugin.dll`.
 
 <details>
 <summary><strong>Build from source (alternative)</strong></summary>
 
-Requires .NET SDK 6.0+:
+Requires the .NET 10 SDK (the test project targets .NET 10):
 
 ```bash
 git clone https://github.com/andyj682/emby-xtream-dedupe.git
@@ -234,22 +236,14 @@ cd emby-xtream-dedupe
 bash build-dedupe.sh
 ```
 
-That builds **both** Emby targets, runs both test configurations, and checks the delete-site
-guard — the same things CI does. The DLLs land at:
+That runs the tests against both the Emby 4.9 and 4.10 SDKs, checks that the DLL loads on both,
+and checks the delete-site guard. CI does the same and also mutation-tests the delete code. The
+DLL lands at `Emby.Xtream.Plugin/out/Emby.Xtream.Plugin.dll`, already named as Emby needs it.
 
-| Target | Path |
-| --- | --- |
-| Emby 4.9.x and 4.10 | `Emby.Xtream.Plugin/out/Emby.Xtream.Plugin.dll` — this is the file releases ship |
-| Emby 4.10 SDK (verification build) | `out_4_10/Emby.Xtream.Plugin.dll` |
+Expect the 4.10 test run to report **more** tests than the 4.9 one: a few cover behavior that
+only exists on that SDK.
 
-Since upstream's single-DLL change (ADR-017), the release asset for both Emby versions is the
-4.9-SDK build from `out/`; the `out_4_10` build exists so the 4.10 SDK stays compiled and tested,
-not because releases need a second file.
-
-Expect the 4.10 test run to report **more** tests than the 4.9 one: a handful of them cover
-methods that only exist in that build.
-
-To build just the 4.9 target, `cd Emby.Xtream.Plugin && bash build.sh` still works.
+To build without the 4.10 checks, `cd Emby.Xtream.Plugin && bash build.sh` still works.
 
 </details>
 
@@ -359,6 +353,7 @@ updates work on both versions.
 | **Configuration backups to keep** | 10 | Daily copies of your exclusions, reviewed marks and settings, taken by a scheduled task (`ConfigBackupCount`; `0` disables) |
 | **Configuration rollback copies to keep** | 10 | Copies taken immediately *before* the plugin writes its configuration, kept beside it (`ConfigRollbackCount`; `0` disables). See below |
 | **Catalog snapshots to keep** | 10 | Dated listings of which provider ID was which title, written during each sync (`CatalogueSnapshotCount`; `0` disables) |
+| **Wanted list folder** | *(blank)* | Where to write `wanted-set.json`, the list of movies you sync, for a Dispatcharr plugin to read (`WantedSetPath`). Blank turns it off. **Dispatcharr must be able to read the folder**; see below |
 
 ---
 
@@ -458,6 +453,65 @@ timezone that container was given. Without the mount the two disagree by your UT
 snapshot taken in the evening can land under tomorrow's date, and a counts log interleaved with the
 plugin's own would run backwards. Mounting the host clock makes every record agree, and it needs no
 `tzdata` package.
+
+---
+
+## Logging wanted movies for Dispatcharr
+
+Providers describe TV episodes well and movies poorly, so a Dispatcharr plugin that picks the best
+stream for each title, or fills in missing stream details, can do it for episodes and not for
+films. Filling that gap means probing movies, and that needs a list of the ones worth probing. This
+plugin is the only thing that knows which movies you sync, so it can write that list down.
+
+Set **Wanted list folder** under **Log Wanted Movies for Dispatcharr** in Settings, and after every
+movie sync the plugin writes `wanted-set.json` there:
+
+```json
+{
+  "schema": 1,
+  "generated_at": "2026-09-16T04:12:33Z",
+  "generator": "emby-strm",
+  "count": 2,
+  "tmdb_ids": [603, 27205],
+  "unidentified": [{ "stream_id": 419883, "name": "Example Film (2019)" }]
+}
+```
+
+- `count` covers `tmdb_ids` only, so a reader can tell a complete file from a partial one.
+- `unidentified` lists wanted movies the provider gave no TMDB ID for, by stream ID and the
+  provider's own name for the title, exactly as sent. Stream IDs change when a provider renumbers
+  its catalog; names usually do not.
+- `resolved_tmdb_id` can also appear on those entries, but only with TMDB Folder Naming and Fallback
+  Lookup both on, so most setups will not see it.
+- `generated_at` is UTC.
+
+The file is rewritten in full on each sync and holds nothing you would lose by deleting it. If any
+VOD category fails to answer, the plugin skips the write and leaves the previous file in place,
+because a list missing a whole category looks exactly like a shorter list you chose.
+
+> [!IMPORTANT]
+> **This does nothing unless Dispatcharr can read the folder, and a wrong path looks exactly like a
+> working one.** The simplest arrangement is a folder beside Emby's config, mounted into Emby
+> read-write and into Dispatcharr read-only:
+>
+> ```yaml
+> # Emby
+> - /path/to/emby/exchange:/exchange
+> # Dispatcharr
+> - /path/to/emby/exchange:/xtream-exchange:ro
+> ```
+>
+> Set the folder to `/exchange` here, and point the reading plugin at `/xtream-exchange`. Confirm
+> from Dispatcharr's side with `docker exec dispatcharr ls /xtream-exchange`; Emby's log reporting a
+> successful write only proves the file went somewhere.
+
+The list contains real titles. It holds no credentials, but treat it like a catalog snapshot and
+keep it on your own host. If **Only sync movies and series you have reviewed** is off, the list is
+your whole included catalog rather than the titles you chose, and the plugin notes that in the log.
+`grep -i "wanted set"` in Emby's log shows each write.
+
+How a particular Dispatcharr plugin uses the file is documented with that plugin. The format and the
+reasoning behind it are in [ADR-F009](docs/decisions/fork/009-publish-the-wanted-set.md).
 
 ---
 

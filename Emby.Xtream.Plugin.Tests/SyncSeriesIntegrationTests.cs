@@ -1363,5 +1363,13 @@ namespace Emby.Xtream.Plugin.Tests
             Assert.Equal(2, Handler.ReceivedUrls.FindAll(u => u.Contains("get_series_info&series_id=1")).Count);
             Assert.Equal(0, svc.SeriesProgress.Failed);
         }
+
+        // -----------------------------------------------------------------
+        // Specials (season 0 / episode 0) must not land on Season 01 / E01
+        // (from andyj682/emby-xtream-dedupe 4c3e0aa)
+        // -----------------------------------------------------------------
+
+
+
     }
 }

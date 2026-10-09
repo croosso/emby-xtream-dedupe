@@ -18,9 +18,9 @@ namespace Emby.Xtream.Plugin.Tests
     /// </summary>
     public class FailedSeriesRetryTests : SyncTestBase
     {
-        // Title-free episode filename, matching the sync's naming (the fork migrated away
-        // from title-bearing names; the title parameter stays so upstream's call sites read
-        // unchanged).
+        // FORK: episode filenames carry no title here (see the episode write loop), so `title`
+        // is accepted for call-site parity with upstream and ignored. Upstream's layout is
+        // "{show} - SxxEyy - {title}.strm".
         private string EpisodePath(string show, int season, int episode, string title)
             => Path.Combine(TempDir.Path, "Shows", show, $"Season {season:D2}",
                 $"{show} - S{season:D2}E{episode:D2}.strm");

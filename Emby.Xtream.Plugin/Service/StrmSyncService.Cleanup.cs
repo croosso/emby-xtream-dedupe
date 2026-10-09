@@ -117,6 +117,7 @@ namespace Emby.Xtream.Plugin.Service
             }
 
             var removed = 0;
+            var kept = 0;
             var writtenDirs = BuildWrittenDirectories(writtenPaths, config.StrmLibraryPath);
 
             // subFolder → { folderNameWithoutIdSuffix → fullPath }. One readdir per subfolder.
@@ -163,10 +164,21 @@ namespace Emby.Xtream.Plugin.Service
                     continue;
                 }
 
+                // An included title wrote this folder moments ago (ADR-F007, upstream ADR-018). Two
+                // provider IDs produced one folder name; deleting it would erase content the user
+                // kept, and the next run would write and delete it again.
+                //
+                // FORK: the message says what to do about it, and kept folders are counted below.
+                // Logged at Info because the state is genuinely wrong at the provider and the user
+                // is the only one who can resolve it, so the line has to be actionable on its own.
                 if (writtenDirs.Contains(NormalizeDirectory(existingDir)))
                 {
+                    kept++;
                     _logger.Info(
-                        "Keeping '{0}' for excluded item '{1}': this sync wrote an included title into the same folder",
+                        "Kept '{0}': excluded item '{1}' matches a folder this sync just wrote for an "
+                        + "included title. Two provider entries share a folder name, so excluding one "
+                        + "would delete the other. Nothing was removed — exclude both entries, or merge "
+                        + "them at the provider, if you meant to drop this title.",
                         existingDir, sanitized);
                     continue;
                 }
@@ -208,6 +220,13 @@ namespace Emby.Xtream.Plugin.Service
                 _logger.Info("Removed {0} folder(s) for explicitly excluded items under {1}", removed, rootFolder);
             }
 
+            if (kept > 0)
+            {
+                _logger.Info(
+                    "Kept {0} folder(s) under {1} that an excluded item matched by name but an included "
+                    + "title had just written. Each is a pair of provider entries sharing one folder name.",
+                    kept, rootFolder);
+            }
 
             return removed;
         }
@@ -312,9 +331,13 @@ namespace Emby.Xtream.Plugin.Service
             // before considering anything for deletion — a user's own STRM that the provider
             // never listed would otherwise look exactly like an orphan. Only orphan candidates
             // are read, so the cost stays proportional to deletions, not to library size.
+            // Ordered so the logged sample below is the same 15 paths on every run rather than
+            // whichever 15 the filesystem happened to enumerate first. Deletion order is
+            // otherwise irrelevant — the files are independent.
             var orphans = existingStrms
                 .Where(s => !validPaths.Contains(s))
                 .Where(s => StrmOwnership.IsOwnedStrm(s, config.BaseUrl, config.DispatcharrUrl))
+                .OrderBy(s => s, StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
             var foreignCount = existingStrms.Length - validPaths.Count - orphans.Count;
@@ -392,9 +415,11 @@ namespace Emby.Xtream.Plugin.Service
                     : deleted;
 
                 // Past the sample the log alone stops being able to answer "what went?" — and
-                // that is exactly the size of event where the question gets asked. The record is
-                // written whatever the log level, because the question is always asked in
-                // hindsight and a diagnostic you had to enable beforehand cannot answer it.
+                // that is exactly the size of event where the question gets asked. Two real
+                // cases motivated this: 360 files under Shows and 126 under Movies, neither
+                // explainable afterwards. The record is written whatever the log level, because
+                // the question is always asked in hindsight and a diagnostic you had to enable
+                // beforehand cannot answer it.
                 var recordPath = deleted.Count > sample.Count
                     ? WriteDeletionRecord(rootPath, deleted)
                     : null;
@@ -410,6 +435,12 @@ namespace Emby.Xtream.Plugin.Service
 
             return removed;
         }
+
+        // ---- Fork-owned delete paths. Moved here from StrmSyncService.cs because upstream's
+        // guard (scripts/check-delete-sites.py, issue #75) requires every delete in the sync
+        // service to live in this file, which is the one Stryker mutates. They are under the
+        // same 75% mutation-score gate as upstream's own cleanup code.
+
 
         /// <summary>
         /// Writes the complete list of paths a cleanup removed, and returns where it went
