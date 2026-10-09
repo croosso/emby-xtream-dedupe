@@ -8,6 +8,21 @@ starting at 1.0.0 — independent of upstream
 
 ## [Unreleased]
 
+### Added
+
+- **Your review decisions now have one owner, so concurrent saves can't silently lose them
+  (ADR-F010).** Every keep/exclude/review/un-review decision used to live in the plugin's
+  single settings file, and each writer — the settings page, a running sync — rewrote that
+  whole file. Two of them at once could silently drop the other's changes, most visibly a
+  decision made in the de-dup view while a sync was running. Decisions are now kept in
+  `decisions.json` under the plugin's records folder and written under a single lock; the
+  settings file keeps a fresh copy, so every existing backup and restore still carries your
+  decisions and nothing changes in the interface.
+
+  One workflow note: once `decisions.json` exists it is the authority, so a settings file
+  edited by hand while the plugin is stopped no longer takes effect. The id-churn repair
+  script prints the extra move-aside step when that matters.
+
 ### Fixed
 
 - **Un-reviewing a movie now sticks (ADR-F008).** Marking a title "unreviewed" and saving looked

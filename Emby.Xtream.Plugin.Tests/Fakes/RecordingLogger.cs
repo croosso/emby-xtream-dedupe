@@ -61,7 +61,14 @@ namespace Emby.Xtream.Plugin.Tests.Fakes
 
         public void Warn(string message, params object[] paramList) => Record(Warnings, message, paramList);
 
-        public void Error(string message, params object[] paramList) { }
+        /// <summary>
+        /// Recorded rather than swallowed: the decision store's unreadable-store errors are the
+        /// fail-open diagnostics (ADR-F010) — a test that cannot see them cannot tell "stood
+        /// down" from "silently wiped the store".
+        /// </summary>
+        public List<string> Errors { get; } = new List<string>();
+
+        public void Error(string message, params object[] paramList) => Record(Errors, message, paramList);
 
         public void Debug(string message, params object[] paramList) => Record(Debugs, message, paramList);
 

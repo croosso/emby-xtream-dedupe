@@ -37,6 +37,7 @@ exists, and a bare `ADR-016` anywhere in the tree is unambiguously upstream's.
 | [ADR-F007](007-never-delete-what-the-sync-just-wrote.md) | Never delete a folder the sync just wrote | Accepted |
 | [ADR-F008](008-unreview-tombstones.md) | Un-reviewing must persist, and take the files with it | Accepted |
 | [ADR-F009](009-publish-the-wanted-set.md) | Publish the wanted set as a file | Accepted |
+| [ADR-F010](010-decision-store-sidecar.md) | Own the decision stores instead of the configuration blob | Accepted |
 
 ## History
 

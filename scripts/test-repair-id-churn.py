@@ -216,6 +216,23 @@ def main():
         except SystemExit as exc:
             ok &= check("aborts on an unparseable reviewed store", "does not parse" in str(exc))
 
+        # ADR-F010: the install steps must point at the authoritative decision store, because
+        # a hand-installed config's id lists are ignored while decisions.json exists. The
+        # derivation mirrors StrmSyncService.ResolveRecordsRoot: RecordsPath wins, otherwise
+        # xtream-backups beside the config.
+        tree = ET.parse(config_path)
+        ok &= check("decision store derived beside the config by default",
+                    repair.decision_store_path(tree, config_path)
+                    == os.path.join(tmp, "xtream-backups", "decisions.json"))
+        relocated = os.path.join(tmp, "records-elsewhere")
+        records_node = tree.getroot().find("RecordsPath")
+        if records_node is None:
+            records_node = ET.SubElement(tree.getroot(), "RecordsPath")
+        records_node.text = relocated
+        ok &= check("decision store follows an explicit RecordsPath",
+                    repair.decision_store_path(tree, config_path)
+                    == os.path.join(relocated, "decisions.json"))
+
     print("\n%s" % ("ALL PASSED" if ok else "FAILURES ABOVE"))
     return 0 if ok else 1
 

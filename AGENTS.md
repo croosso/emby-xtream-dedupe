@@ -97,6 +97,18 @@ Xtream providers type the same field differently across (and within) servers: a 
 
 `Client/Models/TolerantStringConverter` coerces any JSON token into a string (or `null` for structured values) and is registered on `StrmSyncService.JsonOptions` and the `XtreamTunerApi` series-list options. **Don't replace string properties on the provider models with the default converter** — the tolerant one is load-bearing for provider interop. `NumberHandling = AllowReadingFromString` only covers the string → number direction, not number → string. See [ADR-010](docs/decisions/010-tolerant-provider-deserialization.md).
 
+### Decision stores are owned by DecisionStore, not the configuration (ADR-F010)
+
+The seven decision stores (`ExcludedVodStreamIds`, `ExcludedSeriesIds`, `ReviewedVodStreamIdsJson`, `ReviewedSeriesIdsJson`, `UnreviewedVodStreamIdsJson`, `UnreviewedSeriesIdsJson`, `VodDecisionTmdbIdsJson`) have an authoritative home in `decisions.json` under the records root. The configuration fields are mirrors the store refreshes on every mutation — kept so every config backup/copy/restore still carries the decisions and the dashboard needs no new endpoints.
+
+Rules that follow:
+
+- **Never write those fields directly.** All mutations go through `DecisionStore.Mutate` / `AddReviewed` / `Replace`. A direct field write is invisible once the store file exists (it is authoritative), which reads as the store losing decisions.
+- **Configuration saves are routed automatically**: `Plugin.UpdateConfiguration` diffs the incoming stores against the current ones and applies changes through the store, so the dashboard and restore paths need no special handling. A new REST mutation endpoint should call the store directly — never read-modify-write the config.
+- **Sync folds are additive** (`AddReviewed` merges into the *current* checkpoint); the reconcile pass runs read-compute-write under the store's lock. Do not reintroduce "load the set at sync start, serialize the whole set at sync end" — that is the lost-update bug ADR-F010 fixed.
+- **Unreadable is not empty.** Null sets flow through with the pre-ADR-F010 fail-open contract: an unparseable reviewed store disables the review gate, is left untouched for repair, and is never rebuilt into an empty one. A store file in an unknown (newer) format makes the store read-only; an unwritable records root degrades it to config-backed mode — the store never fails the sync.
+- **Offline config repairs** (e.g. `repair-id-churn.py` candidates installed with Emby stopped) must move `decisions.json` aside too, or the repaired id lists are ignored; the repair script prints the path and the step.
+
 ### Per-item exclusions delete folders directly, not via orphan cleanup
 
 `ExcludedVodStreamIds` / `ExcludedSeriesIds` remove an item's files in a targeted pass (`StrmSyncService.RemoveExcludedContent`) that ignores both `CleanupOrphans` and `OrphanSafetyThreshold`. That threshold guards against a provider returning a truncated catalogue; an exclusion is a deliberate user action, so suppressing the delete would just read as the filter doing nothing. Folder matching strips `[tmdbid=…]`/`[tvdbid=…]` suffixes, so a title is found regardless of the metadata-ID naming settings in force when it was written.
