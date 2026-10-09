@@ -11,7 +11,7 @@ starting at 1.0.0 — independent of upstream
 ### Added
 
 - **Your review decisions now have one owner, so concurrent saves can't silently lose them
-  (ADR-F010).** Every keep/exclude/review/un-review decision used to live in the plugin's
+  (ADR-C001).** Every keep/exclude/review/un-review decision used to live in the plugin's
   single settings file, and each writer — the settings page, a running sync — rewrote that
   whole file. Two of them at once could silently drop the other's changes, most visibly a
   decision made in the de-dup view while a sync was running. Decisions are now kept in

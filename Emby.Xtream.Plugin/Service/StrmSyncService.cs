@@ -536,7 +536,7 @@ namespace Emby.Xtream.Plugin.Service
         }
 
         /// <summary>
-        /// The process-wide decision store for this configuration (ADR-F010). Keyed on the records
+        /// The process-wide decision store for this configuration (ADR-C001). Keyed on the records
         /// root, so a configuration that relocates it gets the separate history its records
         /// already have. One store per root, shared by every service instance — Emby constructs
         /// service classes independently of <see cref="Plugin"/>, so instance state would give
@@ -549,7 +549,7 @@ namespace Emby.Xtream.Plugin.Service
 
         /// <summary>
         /// Routes a configuration save's decision-store changes through the store before they land
-        /// (ADR-F010). Called from <see cref="Plugin.UpdateConfiguration"/>, which is the single
+        /// (ADR-C001). Called from <see cref="Plugin.UpdateConfiguration"/>, which is the single
         /// path every dashboard save and every restore already takes — so the review UI keeps
         /// working unchanged while its writes become serialized instead of read-modify-write of
         /// the whole configuration.
@@ -2124,7 +2124,7 @@ namespace Emby.Xtream.Plugin.Service
 
             // The pass runs under the store's lock: reading the stores, computing and writing
             // them back is one operation, so a decision recorded concurrently (a dashboard save,
-            // a future approval webhook) cannot be lost between the read and the write (ADR-F010).
+            // a future approval webhook) cannot be lost between the read and the write (ADR-C001).
             var outcome = GetDecisionStore(config).Mutate(config, state =>
             {
                 if (state.ReviewedVodStreamIds == null)
@@ -2522,7 +2522,7 @@ namespace Emby.Xtream.Plugin.Service
                 // Per-item exclusions (issue #57): split the catalogue before anything else reads it.
                 // The excluded half is kept so its on-disk folders can be removed below.
                 // Read through the decision store: it is the authoritative copy, and the mirrors
-                // can lag it briefly when a configuration save landed an unreadable value (ADR-F010).
+                // can lag it briefly when a configuration save landed an unreadable value (ADR-C001).
                 var excludedVodSet = GetDecisionStore(config).Read(config).ExcludedVodStreamIds;
                 var excludedMovies = new List<Tuple<string, int?>>();
                 var allStreams = fetchedStreams;
@@ -2959,7 +2959,7 @@ namespace Emby.Xtream.Plugin.Service
                     {
                         // Merged into the CURRENT checkpoint through the store rather than
                         // serialized over it, so a decision recorded while the sync ran (a
-                        // dashboard save, a future approval webhook) survives the fold (ADR-F010).
+                        // dashboard save, a future approval webhook) survives the fold (ADR-C001).
                         GetDecisionStore(config).AddReviewed(config, false, autoReviewed.Select(e => e.Item1));
                         saveConfig?.Invoke();
 
@@ -4026,7 +4026,7 @@ namespace Emby.Xtream.Plugin.Service
                     // heal itself as the provider reshuffles ids.
                     if (autoReviewed.Count > 0)
                     {
-                        // Same merge-not-overwrite contract as the movie fold above (ADR-F010).
+                        // Same merge-not-overwrite contract as the movie fold above (ADR-C001).
                         GetDecisionStore(config).AddReviewed(config, true, autoReviewed.Select(e => e.Item1));
                         saveConfig?.Invoke();
 

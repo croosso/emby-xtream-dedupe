@@ -10,7 +10,7 @@ using STJ = System.Text.Json;
 namespace Emby.Xtream.Plugin.Service
 {
     /// <summary>
-    /// A point-in-time snapshot of the seven decision stores (ADR-F010). The reviewed, unreviewed
+    /// A point-in-time snapshot of the seven decision stores (ADR-C001). The reviewed, unreviewed
     /// and identity members are deliberately nullable: <c>null</c> means "the source could not
     /// be parsed", which is not the same as empty, and callers gate on that distinction — see
     /// <see cref="StrmSyncService.DeserializeIdSet"/>. The exclusion members cannot fail to parse
@@ -61,7 +61,7 @@ namespace Emby.Xtream.Plugin.Service
     }
 
     /// <summary>
-    /// The serialized, authoritative home of the seven decision stores (ADR-F010).
+    /// The serialized, authoritative home of the seven decision stores (ADR-C001).
     /// </summary>
     /// <remarks>
     /// <para>
@@ -85,7 +85,7 @@ namespace Emby.Xtream.Plugin.Service
     /// <para>
     /// When no records root resolves (unit tests, or ApplicationPaths not yet initialized) the
     /// store falls back to configuration-backed mode: the configuration fields are the state,
-    /// parsed fresh for every operation. That is exactly the pre-ADR-F010 behavior, including the
+    /// parsed fresh for every operation. That is exactly the pre-ADR-C001 behavior, including the
     /// fail-open handling of unparseable fields — a store that failed to read is never rebuilt,
     /// because rebuilding would silently discard every decision recorded so far.
     /// </para>

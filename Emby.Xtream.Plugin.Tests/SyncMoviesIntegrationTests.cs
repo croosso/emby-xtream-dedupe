@@ -1172,7 +1172,7 @@ namespace Emby.Xtream.Plugin.Tests
                 VodStreamsJson(VodStream(streamId: 1, name: "Kept Movie", added: 1000)), 2);
 
             await ServiceWithRollback(cfgPath).SyncMoviesAsync(config, None, SaveConfig);
-            // Post-ADR-F010 the stores are owned by the decision store, so a change arrives as a
+            // Post-ADR-C001 the stores are owned by the decision store, so a change arrives as a
             // configuration save routed through RouteDecisionStoreWrites — the path a real
             // dashboard edit takes — not as a direct field edit the store would overwrite.
             var saved = DefaultConfig();

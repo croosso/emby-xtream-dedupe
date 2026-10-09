@@ -216,7 +216,7 @@ def main():
         except SystemExit as exc:
             ok &= check("aborts on an unparseable reviewed store", "does not parse" in str(exc))
 
-        # ADR-F010: the install steps must point at the authoritative decision store, because
+        # ADR-C001: the install steps must point at the authoritative decision store, because
         # a hand-installed config's id lists are ignored while decisions.json exists. The
         # derivation mirrors StrmSyncService.ResolveRecordsRoot: RecordsPath wins, otherwise
         # xtream-backups beside the config.

@@ -11,14 +11,14 @@ using Xunit;
 namespace Emby.Xtream.Plugin.Tests
 {
     /// <summary>
-    /// Tests for the serialized decision store (ADR-F010).
+    /// Tests for the serialized decision store (ADR-C001).
     ///
     /// The five decision stores used to be fields of the plugin configuration and every writer
     /// did read-modify-write of that whole blob, so two concurrent writers silently lost one of
     /// them. These tests pin the properties the store exists to guarantee: writes are merged
     /// under a lock, the store file is authoritative once it exists, an unreadable store is
     /// never "repaired" into an empty one, and configuration-backed mode (no records root) is
-    /// exactly the pre-ADR-F010 behavior the existing suite depends on.
+    /// exactly the pre-ADR-C001 behavior the existing suite depends on.
     /// </summary>
     public class DecisionStoreTests
     {

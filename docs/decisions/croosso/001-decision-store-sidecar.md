@@ -1,10 +1,14 @@
-# ADR-F010: Own the Decision Stores Instead of the Configuration Blob
+# ADR-C001: Own the Decision Stores Instead of the Configuration Blob
 
-*(Fork ADR. Numbered in the fork's own `F` sequence so it can never collide with an
-upstream ADR — see [README.md](README.md).)*
+*(Local ADR, numbered in this repo's own `C` sequence so it can never collide with an
+upstream or fork ADR — see [README.md](README.md).)*
 
 **Date**: 2026-09-27
 **Status**: ACCEPTED
+**Renumbered**: from ADR-C001 on 2026-10-08, when this repo's own ADRs moved to the `C`
+namespace so the `F` sequence could stay owned by `andyj682/emby-xtream-dedupe` and merges
+from it can never silently claim the same number for a different decision. References in
+git history and older commit messages still say F010.
 **Affects**: `Service/DecisionStore.cs` (new), `StrmSyncService` (reconcile pass, review
 gates, review folds, exclusion reads), `Plugin.UpdateConfiguration`,
 `scripts/repair-id-churn.py` (install steps), `stryker-config.json` (line-range shift)
@@ -88,7 +92,7 @@ the store keeps fresh.
   through the store before the save lands. A settings-only save never touches the store.
 - **Configuration-backed mode** when no records root resolves (unit tests, or
   ApplicationPaths not yet initialized): the fields are the state, parsed fresh per
-  operation — exactly the pre-ADR-F010 behavior, including the fail-open handling of
+  operation — exactly the pre-ADR-C001 behavior, including the fail-open handling of
   unparseable fields.
 - **An unreadable store is never rebuilt.** The null-vs-empty contract of
   `DeserializeIdSet` is preserved end to end: an unreadable reviewed store disables the

@@ -63,7 +63,7 @@ namespace Emby.Xtream.Plugin.Tests.Fakes
 
         /// <summary>
         /// Recorded rather than swallowed: the decision store's unreadable-store errors are the
-        /// fail-open diagnostics (ADR-F010) — a test that cannot see them cannot tell "stood
+        /// fail-open diagnostics (ADR-C001) — a test that cannot see them cannot tell "stood
         /// down" from "silently wiped the store".
         /// </summary>
         public List<string> Errors { get; } = new List<string>();

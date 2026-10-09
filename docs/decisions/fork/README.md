@@ -37,7 +37,14 @@ exists, and a bare `ADR-016` anywhere in the tree is unambiguously upstream's.
 | [ADR-F007](007-never-delete-what-the-sync-just-wrote.md) | Never delete a folder the sync just wrote | Accepted |
 | [ADR-F008](008-unreview-tombstones.md) | Un-reviewing must persist, and take the files with it | Accepted |
 | [ADR-F009](009-publish-the-wanted-set.md) | Publish the wanted set as a file | Accepted |
-| [ADR-F010](010-decision-store-sidecar.md) | Own the decision stores instead of the configuration blob | Accepted |
+
+ADR-F010 was allocated to *own the decision stores instead of the configuration blob*, then
+moved to this repo's own namespace as
+[ADR-C001](../croosso/001-decision-store-sidecar.md) on 2026-10-08. **The `F` sequence is
+owned by `andyj682/emby-xtream-dedupe`**: this repo does not allocate `F` numbers for its
+own decisions anymore, so a merge from there can never silently claim one for a different
+decision. New ADRs authored here go in [`../croosso/`](../croosso/README.md), cited as
+`ADR-C001`, `ADR-C002`, …
 
 ## History
 
@@ -51,3 +58,8 @@ messages, and in git history generally — use the old numbers.
 `008-unreview-tombstones.md` on main first, so the incoming publish-the-wanted-set ADR
 (older by authoring date, newer by arrival here) took the next number. References in
 the incoming commits' messages still say F008 for it.
+
+`010-decision-store-sidecar.md` was allocated F010 on 2026-10-08 and moved to
+[`../croosso/001-decision-store-sidecar.md`](../croosso/001-decision-store-sidecar.md)
+(ADR-C001) the same day, when this repo's own ADRs moved out of this sequence entirely —
+see the note above the index. References in git history still say F010 for it.

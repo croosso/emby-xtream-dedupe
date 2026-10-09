@@ -97,7 +97,7 @@ Xtream providers type the same field differently across (and within) servers: a 
 
 `Client/Models/TolerantStringConverter` coerces any JSON token into a string (or `null` for structured values) and is registered on `StrmSyncService.JsonOptions` and the `XtreamTunerApi` series-list options. **Don't replace string properties on the provider models with the default converter** — the tolerant one is load-bearing for provider interop. `NumberHandling = AllowReadingFromString` only covers the string → number direction, not number → string. See [ADR-010](docs/decisions/010-tolerant-provider-deserialization.md).
 
-### Decision stores are owned by DecisionStore, not the configuration (ADR-F010)
+### Decision stores are owned by DecisionStore, not the configuration (ADR-C001)
 
 The seven decision stores (`ExcludedVodStreamIds`, `ExcludedSeriesIds`, `ReviewedVodStreamIdsJson`, `ReviewedSeriesIdsJson`, `UnreviewedVodStreamIdsJson`, `UnreviewedSeriesIdsJson`, `VodDecisionTmdbIdsJson`) have an authoritative home in `decisions.json` under the records root. The configuration fields are mirrors the store refreshes on every mutation — kept so every config backup/copy/restore still carries the decisions and the dashboard needs no new endpoints.
 
@@ -105,8 +105,8 @@ Rules that follow:
 
 - **Never write those fields directly.** All mutations go through `DecisionStore.Mutate` / `AddReviewed` / `Replace`. A direct field write is invisible once the store file exists (it is authoritative), which reads as the store losing decisions.
 - **Configuration saves are routed automatically**: `Plugin.UpdateConfiguration` diffs the incoming stores against the current ones and applies changes through the store, so the dashboard and restore paths need no special handling. A new REST mutation endpoint should call the store directly — never read-modify-write the config.
-- **Sync folds are additive** (`AddReviewed` merges into the *current* checkpoint); the reconcile pass runs read-compute-write under the store's lock. Do not reintroduce "load the set at sync start, serialize the whole set at sync end" — that is the lost-update bug ADR-F010 fixed.
-- **Unreadable is not empty.** Null sets flow through with the pre-ADR-F010 fail-open contract: an unparseable reviewed store disables the review gate, is left untouched for repair, and is never rebuilt into an empty one. A store file in an unknown (newer) format makes the store read-only; an unwritable records root degrades it to config-backed mode — the store never fails the sync.
+- **Sync folds are additive** (`AddReviewed` merges into the *current* checkpoint); the reconcile pass runs read-compute-write under the store's lock. Do not reintroduce "load the set at sync start, serialize the whole set at sync end" — that is the lost-update bug ADR-C001 fixed.
+- **Unreadable is not empty.** Null sets flow through with the pre-ADR-C001 fail-open contract: an unparseable reviewed store disables the review gate, is left untouched for repair, and is never rebuilt into an empty one. A store file in an unknown (newer) format makes the store read-only; an unwritable records root degrades it to config-backed mode — the store never fails the sync.
 - **Offline config repairs** (e.g. `repair-id-churn.py` candidates installed with Emby stopped) must move `decisions.json` aside too, or the repaired id lists are ignored; the repair script prints the path and the step.
 
 ### Per-item exclusions delete folders directly, not via orphan cleanup
@@ -134,7 +134,18 @@ Significant decisions are recorded in `docs/decisions/NNN-title.md`. Create a ne
 
 Format: see `docs/decisions/001-bypass-dispatcharr-proxy.md` as the template. Each ADR should include Context, Problem, Alternatives considered, Decision, and Consequences.
 
-Numbering: sequential, zero-padded to 3 digits (`001`, `002`, ...).
+Numbering: sequential, zero-padded to 3 digits (`001`, `002`, ...). There are three
+namespaces, and picking the right one matters because a shared number that means two
+different things is a silent merge conflict (no git conflict, just ambiguity):
+
+- `docs/decisions/` — upstream's (`firestaerter3`), cited `ADR-001`, `ADR-002`, …
+- `docs/decisions/fork/` — the `andyj682` fork's, cited `ADR-F001`, … **This repo does not
+  allocate new `F` numbers**: the sequence is owned by `andyj682/emby-xtream-dedupe`, and
+  both sides minting `F` numbers has already collided twice (two different F008s existed;
+  F010 here sat one ahead of whatever they allocate next). ADRs inherited from that fork
+  stay there with their `F` numbers.
+- `docs/decisions/croosso/` — **this repo's own**, cited `ADR-C001`, `ADR-C002`, … Any
+  decision authored here goes in this namespace, which `andyj682` cannot collide with.
 
 ## Git Workflow
 

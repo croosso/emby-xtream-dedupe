@@ -18,7 +18,7 @@ to a path you choose, for you to diff and install yourself:
 
     docker stop emby
     cp candidate.xml /path/to/emby/config/plugins/configurations/<name>.xml
-    # If the records root holds decisions.json, move it aside too — since ADR-F010 that file,
+    # If the records root holds decisions.json, move it aside too — since ADR-C001 that file,
     # not the config, is the authoritative copy of these id lists (the script prints the path).
     docker start emby
 
@@ -181,9 +181,9 @@ def print_report(results, tmdb_only):
 
 
 def decision_store_path(tree, config_path):
-    """Where the plugin's decision store file lives (ADR-F010).
+    """Where the plugin's decision store file lives (ADR-C001).
 
-    Since ADR-F010 the four id stores have an authoritative home in ``decisions.json`` under
+    Since ADR-C001 the four id stores have an authoritative home in ``decisions.json`` under
     the records root; the config XML holds mirrors the plugin refreshes on every decision. A
     hand-installed config's id lists are therefore IGNORED while that file exists — the install
     steps tell the user to move it aside so the store re-seeds from the repaired config.
@@ -350,7 +350,7 @@ def main(argv):
     print("  2. docker stop emby   (Emby rewrites the file from memory otherwise)")
     print("  3. copy the candidate over the original filename")
     if os.path.exists(store):
-        print("  4. move %s aside too (ADR-F010: the decision store is authoritative and" % store)
+        print("  4. move %s aside too (ADR-C001: the decision store is authoritative and" % store)
         print("     would otherwise ignore the repaired id lists; without it the store re-seeds")
         print("     from the repaired config on the next start)")
         print("  5. docker start emby, then reload the config page with the cache disabled")

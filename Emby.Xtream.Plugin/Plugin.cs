@@ -88,7 +88,7 @@ namespace Emby.Xtream.Plugin
 
             try
             {
-                // ADR-F010: the decision stores are owned by the plugin's store, not the
+                // ADR-C001: the decision stores are owned by the plugin's store, not the
                 // configuration blob. A save that carries different store values (a dashboard
                 // review edit, a restore) is applied through the store's lock before it lands,
                 // so two writers can no longer silently lose one another's decisions. Settings
