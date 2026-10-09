@@ -141,7 +141,9 @@ jobs:
             echo ""
             echo "## Downloads"
             echo ""
-            echo "\`Emby.Xtream.Plugin.dll\` works on Emby 4.9 and 4.10. \`Emby.Xtream.Plugin-4.10.dll\` is the same file under its old name, kept so that 4.10 installs from before this change still update correctly."
+            echo "\`Emby.Xtream.Plugin.dll\` works on Emby 4.9 and 4.10. Install that one."
+            echo ""
+            echo "\`Emby.Xtream.Plugin-4.10.dll\` is the same file under the name this fork's update check uses on Emby 4.10, so installs that update themselves keep doing so. Do not pick it for a new install: **Emby names each plugin's settings file after the DLL**, so under that name the plugin starts with blank settings."
             echo ""
             echo "Every release's changes are recorded in [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md)."
             echo ""
@@ -152,9 +154,10 @@ jobs:
 
       - name: Create release
         run: |
-          # The same DLL under both names. The in-plugin updater downloads Emby.Xtream.Plugin.dll,
-          # and people who installed the old 4.10 build by hand look for the -4.10 name, so both
-          # must stay present and both must be the file that loads.
+          # The same DLL under both names (ADR-017). FORK: this fork's in-plugin updater (1.7.1
+          # onward) picks the asset by Emby version and on 4.10 downloads the -4.10 NAME, so
+          # that name must keep existing or 4.10 installs stop updating. Upstream's updater takes
+          # the plain name. Both must be present, and both must be the file that loads.
           cp out/Emby.Xtream.Plugin.dll out/Emby.Xtream.Plugin-4.10.dll
           gh release create "$GITHUB_REF_NAME" \
             out/Emby.Xtream.Plugin.dll \

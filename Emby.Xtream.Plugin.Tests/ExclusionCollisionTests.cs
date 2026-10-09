@@ -58,25 +58,40 @@ namespace Emby.Xtream.Plugin.Tests
                 "The included title shares a folder name with the excluded one and must not be deleted");
         }
 
-        // Skipped in this fork: upstream treats the case-differing twins as two independent
-        // shows, so excluding one leaves the other protected by its own files. The fork's
-        // ADR-F001 collapses same-named shows into one group (case-insensitively) and
-        // propagates the exclusion across the whole group — so the "kept twin" this test
-        // asserts about is excluded too, by design. The movie-side twins of these tests run
-        // normally: movies never collapse.
-        [Fact(Skip = "Fork ADR-F001 propagates exclusions across the collapse group; the kept twin is excluded too")]
-        public async Task Series_ExcludedTwinDiffersOnlyInCase_KeptTwinSurvivesRepeatedSyncs()
+        // FORK DIVERGENCE (ADR-F001). Upstream's ADR-018 tests here assume two series whose names
+        // differ only in case are different titles, so excluding one must leave the other on disk.
+        // This fork treats every case variant as the same show, everywhere: the de-dup review view
+        // shows them as one row, and the sync propagates an exclusion across the whole name group.
+        // There is no "kept twin" to protect. Upstream's Series_ExcludedTwinDiffersOnlyInCase_*
+        // and Series_KeptTwinDetailFetchFails_* were replaced by this test, which pins that.
+        // (The movie tests above still apply: movies are identified by stream id, not by name.)
+        [Fact]
+        public async Task Series_CaseVariantsOfOneName_AreOneShow_ExclusionCoversEveryVariant()
         {
             var config = DefaultConfig();
             config.ExcludedSeriesIds = new[] { 2 };
-            RegisterTwinSeries();
-            await MakeService().SyncSeriesAsync(config, None, SaveConfig);
-            RegisterTwinSeries();
-            await MakeService().SyncSeriesAsync(config, None, SaveConfig);
+            Handler.RespondWith("action=get_series", SeriesListJson(
+                Series(seriesId: 1, name: "Twin Show", lastModified: "1000"),
+                Series(seriesId: 2, name: "twin show", lastModified: "1000"),
+                Series(seriesId: 3, name: "Twin show", lastModified: "1000"),
+                Series(seriesId: 4, name: "twin Show", lastModified: "1000")));
+            // Deliberately no get_series_info registered: an excluded show is never fetched, and
+            // the fake handler throws on an unregistered request, which would count as a failure.
 
-            Assert.True(HasStrm(ShowDir("Twin Show")),
-                "The included show shares a folder name with the excluded one and must not be deleted");
+            // On disk under one of the casings from an earlier sync. Excluding any variant removes it.
+            var existing = Path.Combine(ShowDir("Twin Show"), "Season 01", "Twin Show - S01E01.strm");
+            Directory.CreateDirectory(Path.GetDirectoryName(existing));
+            File.WriteAllText(existing, "http://fake-xtream/series/user/pass/55.mp4");
+
+            var svc = MakeService();
+            await svc.SyncSeriesAsync(config, None, SaveConfig);
+
+            Assert.DoesNotContain(Handler.ReceivedUrls, u => u.Contains("get_series_info"));
+            Assert.Equal(0, svc.SeriesProgress.Failed);
+            Assert.False(File.Exists(existing),
+                "Excluding one case variant excludes the show, so its existing folder is removed");
         }
+
 
         /// <summary>
         /// The kept twin is only protected by having been written this run. When its category
@@ -152,26 +167,6 @@ namespace Emby.Xtream.Plugin.Tests
             }
         }
 
-        [Fact(Skip = "Fork ADR-F001 propagates exclusions across the collapse group; the kept twin is excluded too")]
-        public async Task Series_KeptTwinDetailFetchFails_NotDeletedByExclusion()
-        {
-            var config = DefaultConfig();
-            config.ExcludedSeriesIds = new[] { 2 };
-            Handler.RespondWith("action=get_series", SeriesListJson(
-                Series(seriesId: 1, name: "Twin Show", lastModified: "1000"),
-                Series(seriesId: 2, name: "twin show", lastModified: "1000")));
-            Handler.RespondWith("action=get_series_info&series_id=1", "{}", HttpStatusCode.InternalServerError);
-            var keptEpisode = Path.Combine(ShowDir("Twin Show"), "Season 01", "Twin Show - S01E01.strm");
-            Directory.CreateDirectory(Path.GetDirectoryName(keptEpisode));
-            File.WriteAllText(keptEpisode, "http://fake-xtream/series/user/pass/55.mp4");
-
-            var svc = MakeService();
-            await svc.SyncSeriesAsync(config, None, SaveConfig);
-
-            Assert.Equal(1, svc.SeriesProgress.Failed);
-            Assert.True(File.Exists(keptEpisode),
-                "A kept show whose episode list failed to load must not be deleted by an exclusion");
-        }
 
         [Fact]
         public async Task Movie_UnrelatedItemFails_ExclusionStillApplied()
@@ -224,14 +219,6 @@ namespace Emby.Xtream.Plugin.Tests
             Assert.True(File.Exists(MovieStrmPath("Keep Me")));
         }
 
-        private void RegisterTwinSeries()
-        {
-            Handler.RespondWith("action=get_series", SeriesListJson(
-                Series(seriesId: 1, name: "Twin Show", lastModified: "1000"),
-                Series(seriesId: 2, name: "twin show", lastModified: "1000")));
-            Handler.RespondWith("action=get_series_info&series_id=1", SeriesDetailJson(seriesId: 1));
-            Handler.RespondWith("action=get_series_info&series_id=2", SeriesDetailJson(seriesId: 2));
-        }
 
         private void RegisterTwinMovies()
         {

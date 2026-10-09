@@ -8,28 +8,6 @@ starting at 1.0.0 — independent of upstream
 
 ## [Unreleased]
 
-### Changed
-
-- **Picked up upstream's changes through `91f27d3` (30 commits).** Everything they shipped since
-  the September merge is now in: honest sync counts (failures are no longer reported as writes),
-  failed series are actually retried by the next sync and by "Retry failed items" instead of
-  being dropped, series whose episode list came back empty are retried once before counting as
-  empty, specials (Season 0 / Episode 0) stay in the Specials folder, category lists that failed
-  to load no longer look like "no categories", the Danger Zone buttons work, and the library is
-  refreshed after a sync that changed files — including a sync that failed part-way through.
-  Where both projects had built the same thing, one implementation was kept: their delete-safety
-  guard replaces this fork's equivalent (their tests cover the same property), and their
-  refinement of this fork's episode-detail retry (one retry, not three) is adopted with it.
-  Their delete code also moved into `StrmSyncService.Cleanup.cs`, so this fork's deletion
-  recording, rollback copies, catalogue snapshots and episode-filename migration moved there
-  with it.
-
-- **One release file for both Emby versions.** Upstream now compile `AddConsumer`/`RemoveConsumer`
-  into every build, so the 4.9 build loads on Emby 4.10 too, and the release ships the same file
-  under both names. The 4.10-specific download and the rename-before-installing dance are gone;
-  existing installs update to a file that loads either way. The 4.10 SDK is still compiled and
-  tested on every build — it just no longer produces a second release file.
-
 ### Fixed
 
 - **Un-reviewing a movie now sticks (ADR-F008).** Marking a title "unreviewed" and saving looked
@@ -38,6 +16,77 @@ starting at 1.0.0 — independent of upstream
   refresh. Un-reviewing now records the decision, and with "Only sync what you have reviewed"
   on, the title's files leave the library on the next sync and the title returns to your review
   queue. Reviewing it again brings it back. Series work the same way.
+
+## [1.9.0] - 2026-10-06
+
+### Added
+
+- **The plugin can now publish the list of movies you keep, so other tools can use it.** Providers
+  describe TV episodes well and movies poorly — resolution and audio codec usually arrive with a
+  series and usually do not with a film — so anything that picks the best stream for you can do it
+  for episodes and not for movies. Closing that gap means something has to go and fetch what is
+  missing, and whatever does that needs to know which movies are worth the effort: probing a whole
+  provider catalog to improve the handful anyone watches is not a job that finishes.
+
+  This plugin is the only thing on your system that knows which movies you want, because you told
+  it. **Wanted list folder**, under **Log Wanted Movies for Dispatcharr** in Settings, writes
+  `wanted-set.json` there at the end of every movie sync — the metadata IDs of the movies it keeps,
+  plus the wanted titles your provider gave no ID for, by stream ID. Blank, the default, turns it
+  off.
+
+  Titles with no provider ID are listed with the provider's own name for them, sent through
+  exactly as the provider wrote it even if you have Name Cleaning on. Stream IDs die when a
+  provider renumbers its catalog and names do not, so this is what keeps a film findable
+  afterwards — and leaving it uncleaned is what keeps it matchable against anything else built
+  from the same provider feed. Where the plugin has also worked out a metadata ID itself it
+  includes that too, though that needs TMDB Folder Naming and Fallback Lookup on, so most setups
+  will not see it; the plugin notes as much in the log rather than leaving you to guess.
+
+  Because the file lists titles, treat it like a catalog snapshot — no credentials in it, but keep
+  it on your own host.
+
+  The file is rewritten in full each sync and holds nothing that exists nowhere else, so deleting it
+  costs you at most one sync's wait. It is skipped when any VOD category failed to answer, because
+  a list missing a whole category looks exactly like a shorter list you chose, and a reader acting
+  on it would quietly do too little work.
+
+  **It does nothing until another container can actually read that folder**, which usually means
+  adding a shared mount and restarting Emby. A path nothing else can see looks identical to a
+  working one, so the README says how to check, and the plugin logs the path and the counts every
+  time it publishes.
+
+### Changed
+
+- **One download now works on both Emby 4.9 and 4.10.** Until now each Emby version needed its
+  own build, and installing the wrong one, or the right one under the wrong file name, could leave
+  the plugin with blank settings. There is now a single `Emby.Xtream.Plugin.dll` for both. Releases
+  still also carry it as `Emby.Xtream.Plugin-4.10.dll`, the name this plugin's update check uses on
+  Emby 4.10, so installs that update themselves carry on doing so. For a new install, pick
+  `Emby.Xtream.Plugin.dll`. From upstream.
+
+### Fixed
+
+These come from merging upstream, and several of them started in this fork and came back.
+
+- **Retrying a failed series could write a second copy of its episodes** beside the real ones,
+  which Emby showed as duplicate episodes. A retry now runs the normal series sync, so it writes
+  exactly what a sync would.
+- **The movie sync summary counted failed titles as written**, so a run with failures read as
+  more successful than it was. The series summary was already fixed here; movies now match.
+- **The Danger Zone section of the settings page did nothing when clicked.**
+- **Category lists sometimes failed to load**, or loaded as "no categories".
+- **When a category fails to load during a sync, removing excluded titles now waits for the next
+  sync.** It used to go ahead with a partial picture of what that sync had written, which is the
+  information that stops it removing a folder you kept.
+- **The library refresh now also runs after a movie retry and after a sync that failed partway**,
+  not only after a clean finish.
+
+### Notes
+
+- **Updating does not trigger a full re-sync.** Upstream's matching release re-fetches every
+  movie and series once after updating, to move specials out of Season 1. This fork has written
+  specials to Season 0 since 1.1.1, so it skips that, and your first sync after updating is an
+  ordinary one.
 
 ## [1.8.0] - 2026-09-16
 
@@ -569,7 +618,8 @@ Xtream `.strm` generator, tuned for Dispatcharr-proxied providers.
 Built on upstream firestaerter3/emby-xtream (MIT); all upstream install, Live TV, Dispatcharr
 integration, and credential-safety features are included.
 
-[Unreleased]: https://github.com/andyj682/emby-xtream-dedupe/compare/dedupe-v1.8.0...HEAD
+[Unreleased]: https://github.com/andyj682/emby-xtream-dedupe/compare/dedupe-v1.9.0...HEAD
+[1.9.0]: https://github.com/andyj682/emby-xtream-dedupe/compare/dedupe-v1.8.0...dedupe-v1.9.0
 [1.8.0]: https://github.com/andyj682/emby-xtream-dedupe/compare/dedupe-v1.7.1...dedupe-v1.8.0
 [1.7.1]: https://github.com/andyj682/emby-xtream-dedupe/compare/dedupe-v1.7.0...dedupe-v1.7.1
 [1.7.0]: https://github.com/andyj682/emby-xtream-dedupe/compare/dedupe-v1.6.0...dedupe-v1.7.0
